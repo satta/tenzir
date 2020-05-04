@@ -20,6 +20,10 @@ Every entry has a category for which we use the following visual abbreviations:
   event rates has been increased to 10 seconds.
   [#1035](https://github.com/tenzir/vast/pull/1035)
 
+- 🧬 The `vast get` subcommand has been added. It can be used to retrieve
+  events by their ids from the database.
+  [#938](https://github.com/tenzir/vast/938)
+
 ## [2020.08.28]
 
 - 🐞 VAST did not terminate when a critical component failed during startup.
