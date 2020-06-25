@@ -14,6 +14,8 @@
 #pragma once
 
 #include "vast/column_index.hpp"
+#include "vast/fbs/partition.hpp"
+#include "vast/filesystem.hpp"
 #include "vast/fwd.hpp"
 #include "vast/path.hpp"
 #include "vast/system/accountant.hpp"

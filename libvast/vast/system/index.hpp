@@ -14,6 +14,7 @@
 #pragma once
 
 #include "vast/detail/flat_lru_cache.hpp"
+#include "vast/detail/lru_cache.hpp"
 #include "vast/detail/stable_map.hpp"
 #include "vast/expression.hpp"
 #include "vast/filesystem.hpp"
@@ -32,6 +33,8 @@
 
 #include <unordered_map>
 #include <vector>
+
+#include "caf/response_promise.hpp"
 
 namespace vast::system {
 
@@ -57,30 +60,162 @@ struct index_state {
     = caf::stream_stage_ptr<table_slice_ptr,
                             caf::broadcast_downstream_manager<table_slice_ptr>>;
 
+  using pending_query_map = detail::stable_map<uuid, evaluation_triples>;
+
+  // equivalent of lookup_state in the old index
+  struct query_state {
+    /// The UUID of the query.
+    vast::uuid id;
+
+    /// The query expression.
+    vast::expression expression;
+
+    /// The evaluators for this query
+    // std::set<caf::actor> evaluators;
+
+    /// Unscheduled partitions.
+    std::vector<uuid> partitions;
+
+    // Maps partition IDs to the EVALUATOR actors we are going to spawn.
+    pending_query_map pqm;
+  };
+
+  /// Loads partitions from disk by UUID.
+  class partition_factory {
+  public:
+    explicit partition_factory(index_state* st = nullptr) : st_(st) {
+      // nop
+    }
+
+    caf::actor operator()(const uuid& id) const;
+
+  private:
+    index_state* st_;
+  };
+
+  /// Accumulates statistics for a given layout.
+  struct layout_statistics {
+    uint64_t count; ///< Number of events indexed.
+  };
+
+  /// Accumulates statistics about indexed data.
+  struct statistics {
+    /// The number of events for a given layout.
+    std::unordered_map<std::string, layout_statistics> layouts;
+  };
+
+  /// Stores partitions sorted by access frequency.
+  using partition_cache_type
+    = detail::lru_cache<uuid, caf::actor, partition_factory>;
+
+  explicit index_state(caf::stateful_actor<index_state>* self);
+
+  // -- persistence ------------------------------------------------------------
+
+  caf::error load_from_disk();
+
+  caf::error flush_to_disk();
+
+  // FIXME: Change these so they take `path` as basename.
+  path index_filename() const;
+
+  path statistics_filename() const;
+
+  caf::error flush_index();
+
+  caf::error flush_statistics();
+
+  // -- query handling
+
+  bool worker_available();
+
+  caf::actor next_worker();
+
+  /// Prepares a subset of partitions from the lookup_state for evaluation.
+  // TODO: Give this a better name that makes it clear that this only launches
+  // await-handlers and the actual building happens after the function is
+  // completed.
+  void request_query_map(query_state& lookup, uint32_t num_partitions);
+
+  /// Spawns one evaluator for each partition.
+  /// @returns a query map for passing to INDEX workers over the spawned
+  ///          EVALUATOR actors.
+  query_map launch_evaluators(pending_query_map pqm, expression expr);
+
+  // -- data members ----------------------------------------------------------
+
+  /// Pointer to the parent actor.
+  caf::stateful_actor<index_state>* self;
+
   /// The streaming stage.
   index_stream_stage_ptr stage;
+
+  /// Allows the index to multiplex between waiting for ready workers and
+  /// queries.
+  caf::behavior has_worker;
 
   /// The single active (read/write) partition.
   active_partition_state active_partition = {};
 
+  /// Partitions that are currently in the process of persisting.
+  /// TODO: An alternative to keeping an explicit set of unpersisted partitions
+  /// would be to add functionality to the LRU cache to "pin" certain items.
+  /// Then (assuming the query interface for both types of partition stays
+  /// identical) we could just use the same cache for unpersisted partitions and
+  /// unpin them after they're safely on disk.
+  std::unordered_map<uuid, caf::actor> unpersisted;
+
   /// The set of passive (read-only) partitions.
-  std::unordered_map<uuid, caf::actor> passive_partitions;
+  partition_cache_type lru_partitions;
+
+  /// The set of partitions that exist on disk.
+  /// TODO: not sure if we even need this
+  std::vector<uuid> persisted_partitions;
 
   /// The maximum number of events that a partition can hold.
   size_t partition_capacity;
 
+  size_t in_mem_partitions;
+
+  size_t taste_partitions;
+
+  /// Maps query IDs to pending lookup state.
+  std::unordered_map<uuid, query_state> pending;
+
+  /// Caches idle workers.
+  std::vector<caf::actor> idle_workers;
+
+  /// The meta index.
+  meta_index meta_idx;
+
   /// The directory for persistent state.
   path dir;
 
+  /// Statistics about processed data.
+  statistics stats;
+
   static inline const char* name = "index";
 };
+
+/// @relates index_state
+template <class Inspector>
+auto inspect(Inspector& f, index_state::layout_statistics& x) {
+  return f(x.count);
+}
+
+/// @relates index_state
+template <class Inspector>
+auto inspect(Inspector& f, index_state::statistics& x) {
+  return f(x.layouts);
+}
 
 /// Indexes events in horizontal partitions.
 /// @param dir The directory of the index.
 /// @param partition_capacity The maximum number of events per partition.
 /// @pre `partition_capacity > 0
 caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
-                    size_t partition_capacity);
+                    size_t partition_capacity, size_t in_mem_partitions,
+                    size_t taste_partitions, size_t num_workers);
 
 } // namespace v2
 

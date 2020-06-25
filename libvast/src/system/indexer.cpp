@@ -17,8 +17,8 @@
 #include "vast/concept/printable/stream.hpp"
 #include "vast/concept/printable/to_string.hpp"
 #include "vast/concept/printable/vast/expression.hpp"
-#include "vast/defaults.hpp"
 #include "vast/concept/printable/vast/type.hpp"
+#include "vast/defaults.hpp"
 #include "vast/detail/assert.hpp"
 #include "vast/expression.hpp"
 #include "vast/fwd.hpp"
@@ -33,13 +33,21 @@
 
 #include <caf/attach_stream_sink.hpp>
 
+#include "caf/binary_serializer.hpp"
+
+// #include "caf/serializer_impl.hpp"
+
+#include <new>
+
+#include <flatbuffers/flatbuffers.h>
+
 namespace vast::system {
 
 namespace v2 {
 
 caf::behavior indexer(caf::stateful_actor<indexer_state>* self, type index_type,
                       caf::settings index_opts) {
-  self->state.name = "indexer" + to_string(index_type);
+  self->state.name = "indexer-" + to_string(index_type);
   return {
     [=](caf::stream<table_slice_column> in) {
       VAST_DEBUG(self, "got a new table slice stream");
@@ -53,6 +61,7 @@ caf::behavior indexer(caf::stateful_actor<indexer_state>* self, type index_type,
           }
         },
         [=](caf::unit_t&, const std::vector<table_slice_column>& xs) {
+          // TODO: assert that this indexer has not yet been serialized
           VAST_ASSERT(self->state.idx != nullptr);
           for (auto& x : xs) {
             for (size_t i = 0; i < x.slice->rows(); ++i) {
@@ -69,14 +78,30 @@ caf::behavior indexer(caf::stateful_actor<indexer_state>* self, type index_type,
           self->quit(err);
         });
     },
+    // FIXME: Get rid of one of these handler, i think the bottom one is
+    // currently unused.
+    [=](const curried_predicate& pred) {
+      VAST_DEBUG(self, "got predicate:", pred);
+      return self->state.idx->lookup(pred.op, make_view(pred.rhs));
+    },
     [=](relational_operator op, const data_view& rhs) {
       VAST_DEBUG(self, "got query for:", op, to_string(rhs));
       return self->state.idx->lookup(op, rhs);
     },
-    [=](atom::snapshot) {
-      // TODO: serialize value index into flatbuffer.
-      return chunk_ptr{};
-    }};
+    [=](atom::snapshot, caf::actor receiver) {
+      std::vector<char> buf;
+      caf::binary_serializer bs{
+        nullptr,
+        buf}; // TODO: do we need to pass the current actor system as first arg?
+      inspect(bs, self->state.idx);
+      auto chunk = chunk::make(std::move(buf));
+      auto sender = self->current_sender();
+      self->send(receiver, atom::done_v, chunk);
+    },
+    [=](atom::shutdown) {
+      self->quit(caf::exit_reason::user_shutdown); // clang-format fix
+    },
+  };
 }
 
 } // namespace v2
