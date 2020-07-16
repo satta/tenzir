@@ -19,9 +19,9 @@
 #include "vast/test/fixtures/events.hpp"
 #include "vast/test/test.hpp"
 
-#include "vast/caf_table_slice_builder.hpp"
 #include "vast/concept/parseable/to.hpp"
 #include "vast/concept/parseable/vast.hpp"
+#include "vast/defaults.hpp"
 
 #include <algorithm>
 
