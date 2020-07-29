@@ -53,6 +53,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "vast/system/make_source.hpp"
+
 using namespace caf;
 
 namespace vast::system {

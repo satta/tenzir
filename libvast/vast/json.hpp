@@ -20,6 +20,7 @@
 #include "vast/detail/stable_map.hpp"
 #include "vast/detail/stack_vector.hpp"
 #include "vast/detail/type_traits.hpp"
+#include "vast/logger.hpp"
 
 #include <caf/detail/type_list.hpp>
 #include <caf/dictionary.hpp>
@@ -206,6 +207,7 @@ template <class K, class V>
 bool convert(const std::map<K, V>& m, json& j) {
   json::object o;
   for (auto& p : m) {
+    VAST_WARNING_ANON(VAST_ARG(p.first));
     auto k = to<std::string>(p.first);
     json v;
     if (!(k && convert(p.second, v)))

@@ -15,8 +15,11 @@
 
 #include "vast/concept/parseable/core/parser.hpp"
 #include "vast/concept/parseable/detail/char_helpers.hpp"
+#include "vast/logger.hpp"
 
 namespace vast {
+
+  thread_local bool debug_x = false;
 
 /// Parses a single character.
 /// @see static_char_parser
@@ -26,6 +29,15 @@ public:
 
   template <class Iterator, class Attribute>
   static bool parse(Iterator& f, const Iterator& l, Attribute& x, char c) {
+    if (f == l) {
+      VAST_WARNING_ANON("f reached l");
+      return false;
+    }
+    if (*f != c) {
+      if (debug_x)
+        VAST_WARNING_ANON(VAST_ARG(*f), VAST_ARG(c));
+      return false;
+    }
     if (f == l || *f != c)
       return false;
     detail::absorb(x, c);

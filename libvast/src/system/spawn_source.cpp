@@ -16,7 +16,6 @@
 #include "vast/config.hpp"
 #include "vast/defaults.hpp"
 #include "vast/detail/make_io_stream.hpp"
-#include "vast/detail/unbox_var.hpp"
 #include "vast/format/csv.hpp"
 #include "vast/format/json.hpp"
 #include "vast/format/json/suricata.hpp"
@@ -37,6 +36,19 @@
 #if VAST_HAVE_PCAP
 #  include "vast/format/pcap.hpp"
 #endif // VAST_HAVE_PCAP
+
+namespace vast::detail {
+
+/// Either declares the local variable `var_name` from `expr` or returns with
+/// an error.
+#define VAST_UNBOX_VAR(var_name, expr)                                         \
+  std::remove_reference_t<decltype(*(expr))> var_name;                         \
+  if (auto maybe = expr; !maybe)                                               \
+    return std::move(maybe.error());                                           \
+  else                                                                         \
+    var_name = std::move(*maybe);
+
+} // namespace vast::detail
 
 namespace vast::system {
 

@@ -24,6 +24,7 @@
 #include "vast/endpoint.hpp"
 #include "vast/error.hpp"
 #include "vast/expression.hpp"
+#include "vast/format/reader.hpp"
 #include "vast/fwd.hpp"
 #include "vast/logger.hpp"
 #include "vast/schema.hpp"

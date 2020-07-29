@@ -15,6 +15,7 @@
 
 #include "vast/aliases.hpp"
 #include "vast/fwd.hpp"
+//#include "vast/system/make_source.hpp"
 
 namespace vast::system {
 
@@ -59,6 +60,5 @@ maybe_actor spawn_test_source(node_actor* self, spawn_arguments& args);
 /// @param args Configures the new actor.
 /// @returns a handle to the spawned actor on success, an error otherwise
 maybe_actor spawn_zeek_source(node_actor* self, spawn_arguments& args);
->>>>>>> parent of 4d1a2d64... Merge pull request #964
 
 } // namespace vast::system
