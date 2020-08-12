@@ -400,7 +400,7 @@ uint64_t segment_store::drop(segment& x) {
   // custom iterator so that a segment can be iterated as a list of table_slice
   // instances.
   for (auto buffer : *fbs::GetSegment(x.chunk()->data())->slices())
-    erased_events += buffer->data_nested_root()->rows();
+    erased_events += buffer->data_nested_root()->num_rows();
   VAST_INFO(this, "erases entire segment", segment_id);
   // Schedule deletion of the segment file when releasing the chunk.
   auto filename = segment_path() / to_string(segment_id);

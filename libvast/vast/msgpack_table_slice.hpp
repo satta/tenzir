@@ -57,7 +57,8 @@ public:
 
   // -- factories --------------------------------------------------------------
 
-  static vast::table_slice_ptr make(vast::table_slice_header header);
+  static vast::table_slice_ptr
+  make(record_type layout, uint64_t num_rows, id offset);
 
   // -- properties -------------------------------------------------------------
 

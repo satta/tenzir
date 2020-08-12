@@ -16,7 +16,6 @@
 #include "vast/fbs/table_slice.hpp"
 #include "vast/fwd.hpp"
 #include "vast/table_slice_column_view.hpp"
-#include "vast/table_slice_header.hpp"
 #include "vast/table_slice_row_view.hpp"
 #include "vast/type.hpp"
 #include "vast/view.hpp"
@@ -46,8 +45,11 @@ public:
   ~table_slice() override;
 
   /// Constructs a table slice from a header.
-  /// @param header The header of the table slice.
-  explicit table_slice(table_slice_header header = {});
+  /// @param layout The flattened layout of the data.
+  /// @param num_rows The number of events (= rows).
+  /// @param offset The offset in the 2^64 ID event space.
+  explicit table_slice(record_type layout = {}, uint64_t num_rows = 0,
+                       id offset = 0);
 
   /// Copy-constructs a table slice.
   /// @param other The table slice to copy.
@@ -86,14 +88,9 @@ public:
 
   // -- properties -------------------------------------------------------------
 
-  /// @returns the table slice header.
-  const table_slice_header& header() const noexcept {
-    return header_;
-  }
-
   /// @returns the table layout.
   const record_type& layout() const noexcept {
-    return header_.layout;
+    return layout_;
   }
 
   /// @returns an identifier for the implementing class.
@@ -101,12 +98,12 @@ public:
 
   /// @returns the layout for columns in range
   /// [first_column, first_column + num_columns).
-  record_type layout(size_type first_column,
-                     size_type num_columns = npos) const;
+  record_type
+  layout(size_type first_column, size_type num_columns = npos) const;
 
   /// @returns the number of rows in the slice.
   size_type rows() const noexcept {
-    return header_.num_rows;
+    return num_rows_;
   }
 
   /// @returns a row view for the given `index`.
@@ -115,7 +112,7 @@ public:
 
   /// @returns the number of rows in the slice.
   size_type columns() const noexcept {
-    return header_.layout.fields.size();
+    return layout_.fields.size();
   }
 
   /// @returns a column view for the given `index`.
@@ -128,18 +125,18 @@ public:
 
   /// @returns the offset in the ID space.
   id offset() const noexcept {
-    return header_.offset;
+    return offset_;
   }
 
   /// Sets the offset in the ID space.
   void offset(id offset) noexcept {
-    header_.offset = offset;
+    offset_ = offset;
   }
 
   /// @returns the name of a column.
   /// @param column The column offset.
   std::string_view column_name(size_t column) const noexcept {
-    return header_.layout.fields[column].name;
+    return layout_.fields[column].name;
   }
 
   /// Retrieves data by specifying 2D-coordinates via row and column.
@@ -155,7 +152,9 @@ public:
 protected:
   // -- member variables -------------------------------------------------------
 
-  table_slice_header header_;
+  record_type layout_ = {}; ///< The flattened layout of the data.
+  uint64_t num_rows_ = 0;   ///< The number of events (= rows).
+  id offset_ = 0;           ///< The offset in the 2^64 ID event space.
 
 private:
   inline static std::atomic<size_t> num_instances_ = 0;
@@ -205,8 +204,8 @@ void select(std::vector<table_slice_ptr>& result, const table_slice_ptr& xs,
 /// @returns new table slices of the same implementation type as `xs` from
 ///          `selection`.
 /// @pre `xs != nullptr`
-std::vector<table_slice_ptr> select(const table_slice_ptr& xs,
-                                    const ids& selection);
+std::vector<table_slice_ptr>
+select(const table_slice_ptr& xs, const ids& selection);
 
 /// Selects the first `num_rows` rows of `slice`.
 /// @param slice The input table slice.
@@ -225,8 +224,8 @@ table_slice_ptr truncate(const table_slice_ptr& slice, size_t num_rows);
 /// @returns two new table slices if `0 < partition_point < slice->rows()`,
 ///          otherwise returns `slice` and a `nullptr`.
 /// @pre `slice != nullptr`
-std::pair<table_slice_ptr, table_slice_ptr> split(const table_slice_ptr& slice,
-                                                  size_t partition_point);
+std::pair<table_slice_ptr, table_slice_ptr>
+split(const table_slice_ptr& slice, size_t partition_point);
 
 /// @relates table_slice
 bool operator==(const table_slice& x, const table_slice& y);

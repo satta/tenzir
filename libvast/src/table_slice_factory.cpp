@@ -13,6 +13,7 @@
 
 #include "vast/table_slice_factory.hpp"
 
+#include "vast/aliases.hpp"
 #include "vast/chunk.hpp"
 #include "vast/config.hpp"
 #include "vast/logger.hpp"
@@ -39,15 +40,19 @@ table_slice_ptr factory_traits<table_slice>::make(chunk_ptr chunk) {
   // Setup a CAF deserializer.
   caf::binary_deserializer source{nullptr, chunk->data(), chunk->size()};
   // Deserialize the class ID and default-construct a table slice.
-  caf::atom_value id;
-  table_slice_header header;
-  if (auto err = source(id, header)) {
+  caf::atom_value implementation_id;
+  record_type layout;
+  uint64_t num_rows;
+  id offset;
+  if (auto err = source(implementation_id, layout, num_rows, offset)) {
     VAST_ERROR_ANON(__func__, "failed to deserialize table slice meta data");
     return nullptr;
   }
-  auto result = factory<table_slice>::make(id, std::move(header));
+  auto result = factory<table_slice>::make(implementation_id, std::move(layout),
+                                           num_rows, offset);
   if (!result) {
-    VAST_ERROR_ANON(__func__, "failed to make table slice for:", to_string(id));
+    VAST_ERROR_ANON(__func__, "failed to make table slice for:",
+                    to_string(implementation_id));
     return nullptr;
   }
   // Skip table slice data already processed.

@@ -31,18 +31,20 @@
 
 namespace vast {
 
-arrow_table_slice::arrow_table_slice(table_slice_header header,
-                                     record_batch_ptr batch)
-  : super(std::move(header)), batch_(std::move(batch)) {
+arrow_table_slice::arrow_table_slice(record_type layout, uint64_t num_rows,
+                                     id offset, record_batch_ptr batch)
+  : super(std::move(layout), num_rows, offset), batch_(std::move(batch)) {
   // nop
 }
 
-table_slice_ptr arrow_table_slice::make(table_slice_header header) {
-  return table_slice_ptr{new arrow_table_slice(std::move(header)), false};
+table_slice_ptr
+arrow_table_slice::make(record_type layout, uint64_t num_rows, id offset) {
+  return table_slice_ptr{
+    new arrow_table_slice(std::move(layout), num_rows, offset), false};
 }
 
 arrow_table_slice* arrow_table_slice::copy() const {
-  return new arrow_table_slice(header_, batch_);
+  return new arrow_table_slice(layout_, num_rows_, offset_, batch_);
 }
 
 namespace {

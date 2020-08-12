@@ -543,9 +543,8 @@ table_slice_ptr arrow_table_slice_builder::finish() {
     columns.emplace_back(builder->finish());
   // Done. Build record batch and table slice.
   auto batch = arrow::RecordBatch::Make(schema, rows_, columns);
-  table_slice_header hdr{layout(), rows_, 0};
   rows_ = 0;
-  return caf::make_copy_on_write<arrow_table_slice>(std::move(hdr),
+  return caf::make_copy_on_write<arrow_table_slice>(layout(), rows_, 0,
                                                     std::move(batch));
 }
 

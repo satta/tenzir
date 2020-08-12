@@ -32,8 +32,9 @@ using namespace vast;
 
 namespace vast {
 
-table_slice_ptr msgpack_table_slice::make(table_slice_header header) {
-  auto ptr = new msgpack_table_slice{std::move(header)};
+table_slice_ptr
+msgpack_table_slice::make(record_type layout, uint64_t num_rows, id offset) {
+  auto ptr = new msgpack_table_slice{std::move(layout), num_rows, offset};
   return table_slice_ptr{ptr, false};
 }
 

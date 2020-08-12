@@ -60,10 +60,9 @@ table_slice_ptr row_major_matrix_table_slice_builder::finish() {
   // Sanity check.
   if (col_ != 0)
     return nullptr;
-  table_slice_header header{layout(), rows(), 0};
   // Get uninitialized memory that keeps the slice object plus the full matrix.
   using impl = row_major_matrix_table_slice;
-  auto ptr = impl::make_uninitialized(std::move(header));
+  auto ptr = impl::make_uninitialized(layout(), rows(), 0);
   // Construct the data block.
   std::uninitialized_move(elements_.begin(), elements_.end(), ptr->storage());
   // Clean up the builder state and return.

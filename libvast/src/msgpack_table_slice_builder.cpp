@@ -116,10 +116,7 @@ table_slice_ptr msgpack_table_slice_builder::finish() {
   // Sanity check.
   if (col_ != 0)
     return nullptr;
-  table_slice_header header;
-  header.layout = layout();
-  header.num_rows = offset_table_.size();
-  auto ptr = new msgpack_table_slice{std::move(header)};
+  auto ptr = new msgpack_table_slice{layout(), offset_table_.size(), 0};
   ptr->offset_table_ = std::move(offset_table_);
   ptr->chunk_ = chunk::make(std::move(buffer_));
   ptr->buffer_ = as_bytes(span{ptr->chunk_->data(), ptr->chunk_->size()});

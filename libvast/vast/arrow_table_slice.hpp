@@ -52,12 +52,19 @@ public:
 
   // -- constructors, destructors, and assignment operators --------------------
 
+  /// Constructs a table slice from a header and a record batch.
+  /// @param layout The flattened layout of the data.
+  /// @param num_rows The number of events (= rows).
+  /// @param offset The offset in the 2^64 ID event space.
+  /// @param batch The Arrow table containing all elements.
   /// @pre `batch != nullptr`
-  arrow_table_slice(vast::table_slice_header header, record_batch_ptr batch);
+  arrow_table_slice(record_type layout, uint64_t num_rows, id offset,
+                    record_batch_ptr batch);
 
   // -- factories --------------------------------------------------------------
 
-  static vast::table_slice_ptr make(vast::table_slice_header header);
+  static vast::table_slice_ptr
+  make(record_type layout, uint64_t num_rows, id offset);
 
   // -- properties -------------------------------------------------------------
 

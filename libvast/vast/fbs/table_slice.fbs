@@ -12,7 +12,7 @@ table TableSlice {
   layout: [ubyte]; // TODO: currently CAF binary; make this a separate table
 
   /// The number of events (= rows).
-  rows: ulong;
+  num_rows: ulong;
 
   /// The offset in the 2^64 ID event space.
   offset: ulong;

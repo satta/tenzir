@@ -57,7 +57,7 @@ vast::ids segment::ids() const {
   for (auto buffer : *ptr->slices()) {
     auto slice = buffer->data_nested_root();
     result.append_bits(false, slice->offset() - result.size());
-    result.append_bits(true, slice->rows());
+    result.append_bits(true, slice->num_rows());
   }
   return result;
 }
@@ -75,7 +75,7 @@ segment::lookup(const vast::ids& xs) const {
   std::vector<table_slice_ptr> result;
   auto f = [](auto buffer) {
     auto slice = buffer->data_nested_root();
-    return std::pair{slice->offset(), slice->offset() + slice->rows()};
+    return std::pair{slice->offset(), slice->offset() + slice->num_rows()};
   };
   auto g = [&](auto buffer) -> caf::error {
     // TODO: bind the lifetime of the table slice to the segment chunk. This

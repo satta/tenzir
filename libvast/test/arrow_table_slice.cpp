@@ -120,8 +120,7 @@ TEST(manual table slice building) {
   // VAST stuff
   record_type layout{{"map", map_type{integer_type{}, integer_type{}}},
                      {"int", integer_type{}}};
-  table_slice_header hdr{layout, 2, 0};
-  auto slice = caf::make_counted<arrow_table_slice>(hdr, batch);
+  auto slice = caf::make_counted<arrow_table_slice>(layout, 2, 0, batch);
   map map1{{1_i, 10_i}, {2_i, 20_i}};
   map map2{{3_i, 30_i}};
   CHECK_VARIANT_EQUAL(slice->at(0, 0), make_view(map1));

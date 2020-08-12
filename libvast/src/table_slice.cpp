@@ -54,15 +54,15 @@ auto cap(size_type pos, size_type num, size_type last) {
   return num == table_slice::npos ? last : std::min(last, pos + num);
 }
 
-} // namespace <anonymous>
+} // namespace
 
-table_slice::table_slice(table_slice_header header)
-  : header_{std::move(header)} {
+table_slice::table_slice(record_type layout, uint64_t num_rows, id offset)
+  : layout_{std::move(layout)}, num_rows_{num_rows}, offset_{offset} {
   ++num_instances_;
 }
 
 table_slice::table_slice(const table_slice& other)
-  : table_slice{other.header()} {
+  : table_slice{other.layout(), other.rows(), other.offset()} {
   // nop
 }
 
@@ -71,8 +71,8 @@ table_slice::~table_slice() {
   --num_instances_;
 }
 
-record_type table_slice::layout(size_type first_column,
-                                size_type num_columns) const {
+record_type
+table_slice::layout(size_type first_column, size_type num_columns) const {
   if (first_column >= columns())
     return {};
   auto col_begin = first_column;
@@ -94,7 +94,7 @@ table_slice_column_view table_slice::column(size_t index) const {
 
 caf::optional<table_slice_column_view>
 table_slice::column(std::string_view name) const {
-  auto& fields = header_.layout.fields;
+  auto& fields = layout().fields;
   for (size_t index = 0; index < fields.size(); ++index)
     if (fields[index].name == name)
       return table_slice_column_view{*this, index};
@@ -133,7 +133,7 @@ pack(flatbuffers::FlatBufferBuilder& builder, table_slice_ptr x) {
   auto data = local_builder.CreateVector(data_ptr, data_buffer.size());
   fbs::TableSliceBuilder table_slice_builder{local_builder};
   table_slice_builder.add_layout(layout);
-  table_slice_builder.add_rows(x->rows());
+  table_slice_builder.add_num_rows(x->rows());
   table_slice_builder.add_offset(x->offset());
   table_slice_builder.add_encoding(*encoding);
   table_slice_builder.add_data(data);
@@ -190,8 +190,7 @@ make_random_table_slices(size_t num_slices, size_t slice_size,
     result.emplace_back(std::move(ptr));
   };
   result.reserve(num_slices);
-  if (auto err = src.read(num_slices * slice_size, slice_size, add_slice)
-                   .first)
+  if (auto err = src.read(num_slices * slice_size, slice_size, add_slice).first)
     return err;
   return result;
 }
@@ -254,8 +253,8 @@ void select(std::vector<table_slice_ptr>& result, const table_slice_ptr& xs,
   push_slice();
 }
 
-std::vector<table_slice_ptr> select(const table_slice_ptr& xs,
-                                    const ids& selection) {
+std::vector<table_slice_ptr>
+select(const table_slice_ptr& xs, const ids& selection) {
   std::vector<table_slice_ptr> result;
   select(result, xs, selection);
   return result;
@@ -284,8 +283,8 @@ table_slice_ptr truncate(const table_slice_ptr& slice, size_t num_rows) {
   return std::move(xs.back());
 }
 
-std::pair<table_slice_ptr, table_slice_ptr> split(const table_slice_ptr& slice,
-                                                  size_t partition_point) {
+std::pair<table_slice_ptr, table_slice_ptr>
+split(const table_slice_ptr& slice, size_t partition_point) {
   VAST_ASSERT(slice != nullptr);
   if (partition_point == 0)
     return {nullptr, slice};
@@ -306,8 +305,7 @@ std::pair<table_slice_ptr, table_slice_ptr> split(const table_slice_ptr& slice,
 bool operator==(const table_slice& x, const table_slice& y) {
   if (&x == &y)
     return true;
-  if (x.rows() != y.rows()
-      || x.columns() != y.columns()
+  if (x.rows() != y.rows() || x.columns() != y.columns()
       || x.layout() != y.layout())
     return false;
   for (size_t row = 0; row < x.rows(); ++row)
@@ -320,9 +318,10 @@ bool operator==(const table_slice& x, const table_slice& y) {
 caf::error inspect(caf::serializer& sink, table_slice_ptr& ptr) {
   if (!ptr)
     return sink(caf::atom("NULL"));
-  return caf::error::eval([&] { return sink(ptr->implementation_id()); },
-                          [&] { return sink(ptr->header()); },
-                          [&] { return ptr->serialize(sink); });
+  return caf::error::eval(
+    [&] { return sink(ptr->implementation_id()); },
+    [&] { return sink(ptr->layout(), ptr->rows(), ptr->offset()); },
+    [&] { return ptr->serialize(sink); });
 }
 
 caf::error inspect(caf::deserializer& source, table_slice_ptr& ptr) {
@@ -333,10 +332,12 @@ caf::error inspect(caf::deserializer& source, table_slice_ptr& ptr) {
     ptr.reset();
     return caf::none;
   }
-  table_slice_header header;
-  if (auto err = source(header))
+  record_type layout;
+  uint64_t num_rows;
+  uint64_t offset;
+  if (auto err = source(layout, num_rows, offset))
     return err;
-  ptr = factory<table_slice>::make(id, std::move(header));
+  ptr = factory<table_slice>::make(id, std::move(layout), num_rows, offset);
   if (!ptr)
     return ec::invalid_table_slice_type;
   return ptr.unshared().deserialize(source);
