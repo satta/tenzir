@@ -93,6 +93,11 @@ public:
 
   // -- container API ---------------------------------------------------------
 
+  /// @returns A writable pointer to the chunk buffer.
+  /// @note This function may only be used when uniqueness is guaranteed.
+  /// @pre `unique()`
+  pointer writable_data();
+
   /// @returns The pointer to the chunk buffer.
   const_pointer data() const;
 
@@ -148,6 +153,7 @@ public:
 
   // -- concepts --------------------------------------------------------------
 
+  friend span<byte> as_writable_bytes(chunk_ptr& x);
   friend span<const byte> as_bytes(const chunk_ptr& x);
 
   friend caf::error write(const path& filename, const chunk_ptr& x);

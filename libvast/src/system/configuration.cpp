@@ -23,7 +23,6 @@
 #include "vast/filesystem.hpp"
 #include "vast/synopsis_factory.hpp"
 #include "vast/table_slice_builder_factory.hpp"
-#include "vast/table_slice_factory.hpp"
 #include "vast/value_index.hpp"
 #include "vast/value_index_factory.hpp"
 

@@ -159,10 +159,6 @@ caf::error arrow_table_slice::deserialize(caf::deserializer& source) {
   return caf::none;
 }
 
-caf::atom_value arrow_table_slice::implementation_id() const noexcept {
-  return class_id;
-}
-
 namespace {
 
 // -- utility class for mapping Arrow lists to VAST container views ------------

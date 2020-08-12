@@ -31,7 +31,7 @@ foreach (schema ${flatbuffers_schemas})
   add_custom_command(
     OUTPUT ${desired_file}
     COMMAND
-      flatbuffers::flatc -b --cpp --scoped-enums -I
+      flatbuffers::flatc -b --cpp --scoped-enums --gen-mutable -I
       ${CMAKE_CURRENT_SOURCE_DIR}/flatbuffers -o ${flatbuffers_output_path}
       ${schema}
     COMMAND
@@ -200,7 +200,6 @@ set(libvast_sources
     src/table_slice_builder_factory.cpp
     src/table_slice_column_view.cpp
     src/table_slice_row_view.cpp
-    src/table_slice_factory.cpp
     src/time.cpp
     src/time_synopsis.cpp
     src/to_events.cpp

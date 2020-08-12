@@ -302,10 +302,6 @@ void msgpack_table_slice::append_column_to_index(size_type col,
   }
 }
 
-caf::atom_value msgpack_table_slice::implementation_id() const noexcept {
-  return class_id;
-}
-
 data_view msgpack_table_slice::at(size_type row, size_type col) const {
   // First find the desired row...
   VAST_ASSERT(row < offset_table_.size());

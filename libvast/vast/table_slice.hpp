@@ -72,29 +72,26 @@ public:
   /// Loads the contents for this slice from `source`.
   virtual caf::error deserialize(caf::deserializer& source) = 0;
 
-  /// Loads a table slice from a chunk. Note that the beginning of the chunk
-  /// data must point to the table slice data right after the implementation
-  /// ID. The default implementation dispatches to `deserialize` with a
-  /// `caf::binary_deserializer`.
-  /// @param chunk The chunk to convert into a table slice.
-  /// @returns An error if the operation fails and `none` otherwise.
-  /// @pre `chunk != nullptr`
-  virtual caf::error load(chunk_ptr chunk);
-
   // -- visitation -------------------------------------------------------------
 
   /// Appends all values in column `col` to `idx`.
-  virtual void append_column_to_index(size_type col, value_index& idx) const;
+  void append_column_to_index(size_type col, value_index& idx) const;
 
   // -- properties -------------------------------------------------------------
 
   /// @returns the table layout.
-  const record_type& layout() const noexcept {
-    return layout_;
-  }
+  const record_type& layout() const noexcept;
+
+  /// @returns the offset in the ID space.
+  id offset() const noexcept;
+
+  /// Sets the offset in the ID space.
+  /// @note This function may only be used when uniqueness is guaranteed.
+  /// @pre `unique()`
+  void offset(id offset) noexcept;
 
   /// @returns an identifier for the implementing class.
-  virtual caf::atom_value implementation_id() const noexcept = 0;
+  caf::atom_value implementation_id() const noexcept;
 
   /// @returns the layout for columns in range
   /// [first_column, first_column + num_columns).
@@ -102,18 +99,14 @@ public:
   layout(size_type first_column, size_type num_columns = npos) const;
 
   /// @returns the number of rows in the slice.
-  size_type rows() const noexcept {
-    return num_rows_;
-  }
+  size_type rows() const noexcept;
 
   /// @returns a row view for the given `index`.
   /// @pre `row < rows()`
   table_slice_row_view row(size_t index) const;
 
   /// @returns the number of rows in the slice.
-  size_type columns() const noexcept {
-    return layout_.fields.size();
-  }
+  size_type columns() const noexcept;
 
   /// @returns a column view for the given `index`.
   /// @pre `column < columns()`
@@ -123,29 +116,17 @@ public:
   ///          no column matches the `name`.
   caf::optional<table_slice_column_view> column(std::string_view name) const;
 
-  /// @returns the offset in the ID space.
-  id offset() const noexcept {
-    return offset_;
-  }
-
-  /// Sets the offset in the ID space.
-  void offset(id offset) noexcept {
-    offset_ = offset;
-  }
-
   /// @returns the name of a column.
   /// @param column The column offset.
-  std::string_view column_name(size_t column) const noexcept {
-    return layout_.fields[column].name;
-  }
+  std::string_view column_name(size_t column) const noexcept;
 
   /// Retrieves data by specifying 2D-coordinates via row and column.
   /// @param row The row offset.
   /// @param col The column offset.
   /// @pre `row < rows() && col < columns()`
-  virtual data_view at(size_type row, size_type col) const = 0;
+  data_view at(size_type row, size_type col) const;
 
-  static int instances() {
+  inline static int instances() {
     return num_instances_;
   }
 
@@ -155,6 +136,14 @@ protected:
   record_type layout_ = {}; ///< The flattened layout of the data.
   uint64_t num_rows_ = 0;   ///< The number of events (= rows).
   id offset_ = 0;           ///< The offset in the 2^64 ID event space.
+
+  chunk_ptr chunk_;
+
+  // TODO: In order to be able to return the layout by const reference, we need
+  // to cache it. Once the type system is converted to FlatBuffers, we can
+  // change `vast.fbs.TableSlice` such that it stores the layout as a
+  // `vast.fbs.RecordType` instead of `[ubyte]`.
+  std::shared_ptr<record_type> cached_layout_;
 
 private:
   inline static std::atomic<size_t> num_instances_ = 0;

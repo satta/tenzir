@@ -108,6 +108,26 @@ const Flatbuffer* as_flatbuffer(span<const byte, Extent> xs) {
   return flatbuffers::GetRoot<Flatbuffer>(data);
 }
 
+/// Generic unpacking utility.
+/// @tparam Flatbuffer The flatbuffer type to unpack.
+/// @param xs The buffer to unpack a flatbuffer from.
+/// @returns A pointer to the unpacked flatbuffer of type `Flatbuffer` or
+///          `nullptr` if verification failed.
+/// @relates unverified_unpack
+template <class Flatbuffer, size_t Extent = dynamic_extent>
+Flatbuffer* as_mutable_flatbuffer(span<byte, Extent> xs) {
+  // Verify the buffer.
+  auto data = reinterpret_cast<uint8_t*>(xs.data());
+  auto size = xs.size();
+  char const* identifier = nullptr;
+  if (flatbuffers::BufferHasIdentifier(data, file_identifier))
+    identifier = file_identifier;
+  flatbuffers::Verifier verifier{data, size};
+  if (!verifier.template VerifyBuffer<Flatbuffer>(identifier))
+    return nullptr;
+  return flatbuffers::GetMutableRoot<Flatbuffer>(data);
+}
+
 /// Wraps an object into a flatbuffer. This function requires existance of an
 /// overload `pack(flatbuffers::FlatBufferBuilder&, const T&)` that can be
 /// found via ADL. While *packing* incrementally adds objects to a builder,

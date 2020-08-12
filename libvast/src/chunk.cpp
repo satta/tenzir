@@ -66,6 +66,12 @@ chunk::~chunk() {
   deleter_();
 }
 
+chunk::pointer chunk::writable_data() {
+  // Only a non-shared chunk may be mutated.
+  VAST_ASSERT(unique());
+  return data_;
+}
+
 chunk::const_pointer chunk::data() const {
   return data_;
 }
@@ -104,6 +110,13 @@ chunk::chunk(void* ptr, size_type size, deleter_type deleter)
   VAST_ASSERT(deleter_);
 }
 
+span<byte> as_writable_bytes(chunk_ptr& x) {
+  if (!x)
+    return {};
+  auto ptr = reinterpret_cast<byte*>(x->writable_data());
+  return span<byte>{ptr, x->size()};
+}
+
 span<const byte> as_bytes(const chunk_ptr& x) {
   if (!x)
     return {};
@@ -132,7 +145,9 @@ caf::error read(const path& filename, chunk_ptr& x) {
     return make_error(ec::filesystem_error, "failed open file");
   x = chunk::make(*size);
   size_t bytes_read;
-  auto ptr = const_cast<char*>(x->data()); // okay, we just created it.
+  // We're fine to mutate here since we've just created the chunk; we're able to
+  // guarantee that there's only ever a single copy of it.
+  auto ptr = x->writable_data();
   if (!f.read(ptr, x->size(), &bytes_read))
     return make_error(ec::filesystem_error, "failed to read chunk");
   if (bytes_read != x->size())
@@ -144,7 +159,8 @@ caf::error inspect(caf::serializer& sink, const chunk_ptr& x) {
   using vast::detail::narrow;
   if (x == nullptr)
     return sink(uint32_t{0});
-  auto data = const_cast<chunk::pointer>(x->data());
+  // It's fine to use writable_data here, the CAF serializer won't touch it.
+  auto data = x->writable_data();
   return caf::error::eval([&] { return sink(narrow<uint32_t>(x->size())); },
                           [&] { return sink.apply_raw(x->size(), data); });
 }
@@ -158,7 +174,7 @@ caf::error inspect(caf::deserializer& source, chunk_ptr& x) {
     return caf::none;
   }
   x = chunk::make(n);
-  auto data = const_cast<chunk::pointer>(x->data());
+  auto data = x->writable_data();
   return source.apply_raw(n, data);
 }
 

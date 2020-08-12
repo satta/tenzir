@@ -593,7 +593,9 @@ bool table_slice_row_evaluator::operator()(const attribute_extractor& e,
       return caf::holds_alternative<time_type>(x.type)
              && has_attribute(x.type, "timestamp");
     };
-    auto& fs = slice_.layout().fields;
+    auto layout = slice_.layout();
+    auto& fs = layout.fields;
+    // const auto& fs = slice_.layout().fields;
     auto i = std::find_if(fs.begin(), fs.end(), pred);
     if (i == fs.end())
       return false;

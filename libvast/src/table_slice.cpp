@@ -21,12 +21,13 @@
 #include "vast/error.hpp"
 #include "vast/event.hpp"
 #include "vast/factory.hpp"
+#include "vast/fbs/table_slice.hpp"
+#include "vast/fbs/utils.hpp"
 #include "vast/format/test.hpp"
 #include "vast/logger.hpp"
 #include "vast/table_slice_builder.hpp"
 #include "vast/table_slice_builder_factory.hpp"
 #include "vast/table_slice_column_view.hpp"
-#include "vast/table_slice_factory.hpp"
 #include "vast/table_slice_row_view.hpp"
 #include "vast/value.hpp"
 #include "vast/value_index.hpp"
@@ -101,6 +102,10 @@ table_slice::column(std::string_view name) const {
   return caf::none;
 }
 
+std::string_view table_slice::column_name(size_t column) const noexcept {
+  return layout().fields[column].name;
+}
+
 // TODO: this function will boil down to accessing the chunk inside the table
 // slice and then calling GetTableSlice(buf). But until we touch the table
 // slice internals, we use this helper.
@@ -156,18 +161,95 @@ caf::error unpack(const fbs::TableSlice& x, table_slice_ptr& y) {
   return source(y);
 }
 
-caf::error table_slice::load(chunk_ptr chunk) {
-  VAST_ASSERT(chunk != nullptr);
-  auto data = const_cast<char*>(chunk->data()); // CAF won't touch it.
-  caf::binary_deserializer source{nullptr, data, chunk->size()};
-  return deserialize(source);
-}
-
 void table_slice::append_column_to_index(size_type col,
                                          value_index& idx) const {
-  for (size_type row = 0; row < rows(); ++row)
-    idx.append(at(row, col), offset() + row);
+  auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+  VAST_ASSERT(slice);
+  switch (slice->encoding()) {
+    case fbs::Encoding::Arrow:
+      // FIXME: implement
+      break;
+    case fbs::Encoding::MessagePack:
+      // FIXME: implement
+      break;
+    default:
+      // Default behavior.
+      for (size_type row = 0; row < rows(); ++row)
+        idx.append(at(row, col), offset() + row);
+      break;
+  }
 }
+
+const record_type& table_slice::layout() const noexcept {
+  // We memoize the layout such that we can treturn it by const reference. This
+  // is only necessary until we can access the layout from the FlatBuffers view
+  // directly.
+  if (!cached_layout_) {
+    auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+    VAST_ASSERT(slice);
+    auto ptr = reinterpret_cast<const char*>(slice->data()->Data());
+    caf::binary_deserializer source{nullptr, ptr, slice->data()->size()};
+    auto err = source(*cached_layout_);
+    VAST_ASSERT(!err);
+  }
+  return *cached_layout_;
+}
+
+caf::atom_value table_slice::implementation_id() const noexcept {
+  auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+  VAST_ASSERT(slice);
+  switch (slice->encoding()) {
+    case fbs::Encoding::Arrow:
+      return caf::atom("arrow");
+    case fbs::Encoding::MessagePack:
+      return caf::atom("msgpack");
+  }
+  // This error can not be recovered from, so we just abort.
+  die("invalid table slice encoding");
+}
+
+table_slice::size_type table_slice::rows() const noexcept {
+  auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+  VAST_ASSERT(slice);
+  return slice->num_rows();
+}
+
+size_type table_slice::columns() const noexcept {
+  return layout().fields.size();
+}
+
+id table_slice::offset() const noexcept {
+  auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+  VAST_ASSERT(slice);
+  return slice->offset();
+}
+
+void table_slice::offset(id offset) noexcept {
+  VAST_ASSERT(unique());
+  auto slice
+    = fbs::as_mutable_flatbuffer<fbs::TableSlice>(as_writable_bytes(chunk_));
+  VAST_ASSERT(slice);
+  auto result = slice->mutate_offset(offset);
+  VAST_ASSERT(result);
+}
+
+data_view table_slice::at(size_type row, size_type col) const {
+  auto slice = fbs::as_flatbuffer<fbs::TableSlice>(as_bytes(chunk_));
+  VAST_ASSERT(slice);
+  switch (slice->encoding()) {
+    case fbs::Encoding::Arrow:
+      // FIXME: implement
+      break;
+    case fbs::Encoding::MessagePack:
+      // FIXME: implement
+      break;
+  }
+  // FIXME: handle failure
+  return {};
+}
+
+// FIXME: remove marker
+// -- random junk below, no need to touch ------------------------------------
 
 caf::expected<std::vector<table_slice_ptr>>
 make_random_table_slices(size_t num_slices, size_t slice_size,
@@ -337,6 +419,7 @@ caf::error inspect(caf::deserializer& source, table_slice_ptr& ptr) {
   uint64_t offset;
   if (auto err = source(layout, num_rows, offset))
     return err;
+  // TODO revisit this function
   ptr = factory<table_slice>::make(id, std::move(layout), num_rows, offset);
   if (!ptr)
     return ec::invalid_table_slice_type;

@@ -76,8 +76,6 @@ public:
 
   void append_column_to_index(size_type col, value_index& idx) const override;
 
-  caf::atom_value implementation_id() const noexcept override;
-
   vast::data_view at(size_type row, size_type col) const override;
 
   record_batch_ptr batch() const {
