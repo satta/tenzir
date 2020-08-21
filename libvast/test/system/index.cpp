@@ -23,10 +23,8 @@
 #include "vast/concept/parseable/vast/expression.hpp"
 #include "vast/concept/printable/std/chrono.hpp"
 #include "vast/concept/printable/to_string.hpp"
-#include "vast/concept/printable/vast/event.hpp"
 #include "vast/detail/spawn_container_source.hpp"
 #include "vast/detail/spawn_generator_source.hpp"
-#include "vast/event.hpp"
 #include "vast/fwd.hpp"
 #include "vast/ids.hpp"
 #include "vast/query_options.hpp"
@@ -136,7 +134,7 @@ FIXTURE_SCOPE(index_tests, fixture)
 
 TEST(one-shot integer query result) {
   MESSAGE("fill first " << taste_count << " partitions");
-  auto slices = rebase(first_n(alternating_integers_slices, taste_count));
+  auto slices = rebase(first_n(alternating_integers, taste_count));
   auto src = detail::spawn_container_source(sys, slices, index);
   run();
   MESSAGE("query half of the values");
@@ -156,7 +154,7 @@ TEST(one-shot integer query result) {
 TEST(iterable integer query result) {
   auto partitions = taste_count * 3;
   MESSAGE("fill first " << partitions << " partitions");
-  auto slices = first_n(alternating_integers_slices, partitions);
+  auto slices = first_n(alternating_integers, partitions);
   auto src = detail::spawn_container_source(sys, slices, index);
   run();
   MESSAGE("query half of the values");
@@ -165,7 +163,7 @@ TEST(iterable integer query result) {
   CHECK_EQUAL(hits, partitions);
   CHECK_EQUAL(scheduled, taste_count);
   ids expected_result;
-  expected_result.append_bits(false, alternating_integers[0].id());
+  expected_result.append_bits(false, alternating_integers[0]->offset());
   for (size_t i = 0; i < (slice_size * partitions) / 2; ++i) {
     expected_result.append_bit(false);
     expected_result.append_bit(true);
@@ -178,7 +176,7 @@ TEST(iterable integer query result) {
 TEST(iterable zeek conn log query result) {
   REQUIRE_EQUAL(zeek_conn_log.size(), 20u);
   MESSAGE("ingest conn.log slices");
-  detail::spawn_container_source(sys, zeek_conn_log_slices, index);
+  detail::spawn_container_source(sys, zeek_conn_log, index);
   run();
   /// Aligns `x` to the size of `y`.
   auto align = [&](ids& x, const ids& y) {

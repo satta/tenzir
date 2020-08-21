@@ -20,17 +20,14 @@
 
 #include "vast/caf_table_slice_builder.hpp"
 #include "vast/concept/printable/stream.hpp"
-#include "vast/concept/printable/vast/event.hpp"
 #include "vast/defaults.hpp"
 #include "vast/detail/make_io_stream.hpp"
 #include "vast/detail/spawn_container_source.hpp"
-#include "vast/event.hpp"
 #include "vast/format/zeek.hpp"
 #include "vast/system/archive.hpp"
 #include "vast/system/source.hpp"
 #include "vast/system/type_registry.hpp"
 #include "vast/table_slice.hpp"
-#include "vast/to_events.hpp"
 
 using namespace caf;
 using namespace vast;
@@ -39,29 +36,30 @@ using namespace vast;
 
 namespace {
 
-using event_buffer = std::vector<event>;
-
 behavior dummy_sink(event_based_actor* self, size_t num_events, actor overseer) {
+  auto count_events = [](auto& xs) {
+    size_t result = 0;
+    for (auto& x : xs)
+      result += x->rows();
+    return result;
+  };
   return {
     [=](stream<table_slice_ptr> in) {
       self->unbecome();
       self->send(overseer, atom::ok_v);
       self->make_sink(
         in,
-        [=](event_buffer&) {
+        [=](std::vector<table_slice_ptr>&) {
           // nop
         },
-        [=](event_buffer& xs, table_slice_ptr x) {
-          for (auto& e : to_events(*x)) {
-            xs.emplace_back(std::move(e));
-            if (xs.size() == num_events) {
-              self->send(overseer, xs);
-            } else if (xs.size() > num_events) {
-              FAIL("dummy sink received too many events");
-            }
-          }
-        }
-      );
+        [=](std::vector<table_slice_ptr>& xs, table_slice_ptr x) {
+          xs.emplace_back(std::move(x));
+          auto num_received = count_events(xs);
+          if (num_received == num_events)
+            self->send(overseer, xs);
+          else if (num_received > num_events)
+            FAIL("dummy sink received too many events");
+        });
     }
   };
 }
@@ -69,16 +67,17 @@ behavior dummy_sink(event_based_actor* self, size_t num_events, actor overseer) 
 template <class Base>
 struct importer_fixture : Base {
   importer_fixture(size_t table_slice_size) : slice_size(table_slice_size) {
-    using vast::system::archive_type;
     MESSAGE("spawn importer");
     this->directory /= "importer";
+    using vast::system::archive_type;
+    using vast::system::type_registry_type;
     importer
       = this->self->spawn(system::importer, this->directory, archive_type{},
-                          caf::actor{}, vast::system::type_registry_type{});
+                          caf::actor{}, type_registry_type{});
   }
 
   ~importer_fixture() {
-    anon_send_exit(importer, exit_reason::user_shutdown);
+    this->self->send_exit(importer, exit_reason::user_shutdown);
   }
 
   auto make_sink() {
@@ -96,8 +95,7 @@ struct importer_fixture : Base {
 
   auto make_source() {
     return vast::detail::spawn_container_source(this->self->system(),
-                                                this->zeek_conn_log_slices,
-                                                importer);
+                                                this->zeek_conn_log, importer);
   }
 
   auto make_zeek_source() {
@@ -113,14 +111,12 @@ struct importer_fixture : Base {
   }
 
   // Checks whether two event buffers are equal.
-  void verify(const event_buffer& result, const event_buffer& reference) {
+  void verify(const std::vector<table_slice_ptr>& result,
+              const std::vector<table_slice_ptr>& reference) {
     REQUIRE_EQUAL(result.size(), reference.size());
-    for (size_t i = 0; i < result.size(); ++i) {
-      auto flat_ref = flatten(reference[i]);
-      if (result[i].data() != flat_ref.data())
-        FAIL("result differs from reference at index " << i << ": \n"
-             << result[i] << " !! " << flat_ref);
-    }
+    for (size_t i = 0; i < result.size(); ++i)
+      if (*result[i] != *reference[i])
+        FAIL("result differs from reference at index " << i);
   }
 
   size_t slice_size;
@@ -148,13 +144,11 @@ struct deterministic_fixture : deterministic_fixture_base {
   }
 
   auto fetch_result() {
-    if (!received<event_buffer>(self))
+    if (!received<std::vector<table_slice_ptr>>(self))
       FAIL("no result available");
-    event_buffer result;
-    self->receive([&](event_buffer& xs) {
-      using std::swap;
-      swap(xs, result);
-    });
+    std::vector<table_slice_ptr> result;
+    self->receive(
+      [&](std::vector<table_slice_ptr>& xs) { result = std::move(xs); });
     return result;
   }
 };
@@ -277,10 +271,9 @@ struct nondeterministic_fixture : nondeterministic_fixture_base {
   }
 
   auto fetch_result() {
-    event_buffer result;
-    self->receive([&](event_buffer& xs) {
-      result = std::move(xs);
-    });
+    std::vector<table_slice_ptr> result;
+    self->receive(
+      [&](std::vector<table_slice_ptr>& xs) { result = std::move(xs); });
     return result;
   }
 };
