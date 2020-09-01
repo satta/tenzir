@@ -74,7 +74,10 @@ caf::behavior readonly_indexer(caf::stateful_actor<indexer_state>* self,
     },
     [=](const curried_predicate& pred) {
       VAST_DEBUG(self, "got predicate:", pred);
-      return self->state.idx->lookup(pred.op, make_view(pred.rhs));
+      VAST_ASSERT(self->state.idx);
+      auto& idx = *self->state.idx;
+      auto rep = to_internal(idx.type(), make_view(pred.rhs));
+      return idx.lookup(pred.op, rep);
     },
     [=](atom::shutdown) { self->quit(caf::exit_reason::user_shutdown); },
   };
