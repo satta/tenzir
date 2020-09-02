@@ -22,6 +22,36 @@
 
 #include <caf/response_promise.hpp>
 
+#include <spdlog/spdlog.h>
+
+template <class T, class Char>
+struct fmt::formatter<
+  T, Char,
+  std::enable_if_t<
+    vast::detail::has_to_string<
+      T> && fmt::internal::type_constant<T, Char>::value == fmt::internal::type::custom_type>> {
+  constexpr auto parse(format_parse_context& ctx) {
+    return ctx.begin();
+  }
+
+  template <typename FormatContext>
+  auto format(const T& x, FormatContext& ctx) {
+    return format_to(ctx.out(), "{}", to_string(x));
+  }
+};
+
+template <>
+struct fmt::formatter<caf::event_based_actor> {
+  constexpr auto parse(format_parse_context& ctx) {
+    return ctx.begin();
+  }
+
+  template <typename FormatContext>
+  auto format(const caf::event_based_actor& x, FormatContext& ctx) {
+    return format_to(ctx.out(), "{}", x.name());
+  }
+};
+
 namespace vast::system {
 
 template <class Policy>
@@ -45,7 +75,8 @@ void shutdown(caf::event_based_actor* self, std::vector<caf::actor> xs,
         self->quit(caf::exit_reason::user_shutdown);
       },
       [=](const caf::error& err) {
-        VAST_ERROR(self, "failed to cleanly terminate dependent actors", err);
+        // VAST_ERROR(self, "failed to cleanly terminate dependent actors", err);
+        spdlog::error("{} Some error message with arg: {}", *self, err);
         die("failed to terminate dependent actors in given time window");
       });
 }

@@ -12,6 +12,7 @@
 , libpcap
 , arrow-cpp
 , flatbuffers
+, spdlog
 , broker
 , jemalloc
 , python3
@@ -63,7 +64,7 @@ stdenv.mkDerivation rec {
 
   nativeBuildInputs = [ cmake cmake-format ];
   propagatedNativeBuildInputs = [ pkgconfig pandoc ];
-  buildInputs = [ libpcap flatbuffers jemalloc broker ];
+  buildInputs = [ libpcap flatbuffers jemalloc spdlog broker ];
   propagatedBuildInputs = [ arrow-cpp caf ];
 
   cmakeFlags = [

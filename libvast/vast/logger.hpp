@@ -41,9 +41,10 @@ void fixup_logger(const system::configuration& cfg);
 
 #if defined(VAST_LOG_LEVEL)
 
-#define VAST_LOG_IMPL(lvl, msg) CAF_LOG_IMPL("vast", lvl, msg)
+//#define VAST_LOG_IMPL(lvl, msg) CAF_LOG_IMPL("vast", lvl, msg)
+#  define VAST_LOG_IMPL(lvl, fstr, msg) CAF_LOG_IMPL("vast", lvl, msg)
 
-#define VAST_LOG_2(lvl, m1) VAST_LOG_IMPL(lvl, m1)
+#  define VAST_LOG_2(lvl, m1) VAST_LOG_IMPL(lvl, "{}", m1)
 
 #  define VAST_LOG_3(lvl, m1, m2) VAST_LOG_IMPL(lvl, (m1) << (m2))
 
@@ -172,13 +173,17 @@ auto id_or_name(T&& x) {
 
 #  endif // VAST_LOG_LEVEL > VAST_LOG_LEVEL_TRACE
 
-#  if VAST_LOG_LEVEL >= VAST_LOG_LEVEL_ERROR
-#    define VAST_ERROR(...)                                                    \
-      VAST_LOG_COMPONENT(VAST_LOG_LEVEL_ERROR, __VA_ARGS__)
-#    define VAST_ERROR_ANON(...) VAST_LOG(VAST_LOG_LEVEL_ERROR, __VA_ARGS__)
+#  if 0
+#    if VAST_LOG_LEVEL >= VAST_LOG_LEVEL_ERROR
+#      define VAST_ERROR(...)                                                  \
+        VAST_LOG_COMPONENT(VAST_LOG_LEVEL_ERROR, __VA_ARGS__)
+#      define VAST_ERROR_ANON(...) VAST_LOG(VAST_LOG_LEVEL_ERROR, __VA_ARGS__)
+#    else
+#      define VAST_ERROR(...) VAST_LOG_DISCARD_ARGS(__VA_ARGS__)
+#      define VAST_ERROR_ANON(...) VAST_LOG_DISCARD_ARGS(__VA_ARGS__)
+#    endif
 #  else
-#    define VAST_ERROR(...) VAST_LOG_DISCARD_ARGS(__VA_ARGS__)
-#    define VAST_ERROR_ANON(...) VAST_LOG_DISCARD_ARGS(__VA_ARGS__)
+#    define VAST_ERROR(...) SPDLOG_ERROR(__VA_ARGS__);
 #  endif
 
 #  if VAST_LOG_LEVEL >= VAST_LOG_LEVEL_WARNING
