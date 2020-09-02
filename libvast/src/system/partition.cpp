@@ -55,6 +55,8 @@
 #include "caf/binary_serializer.hpp"
 #include "caf/broadcast_downstream_manager.hpp"
 #include "caf/deserializer.hpp"
+#include "caf/error.hpp"
+#include "caf/fwd.hpp"
 #include "caf/sec.hpp"
 
 using namespace std::chrono;
@@ -78,8 +80,7 @@ caf::actor indexer_at(const PartitionState& state, size_t position) {
 
 template <typename PartitionState>
 caf::actor fetch_indexer(const PartitionState& state, const data_extractor& dx,
-                         [[maybe_unused]] relational_operator op,
-                         [[maybe_unused]] const data& x) {
+                         relational_operator op, const data& x) {
   VAST_TRACE(VAST_ARG(dx), VAST_ARG(op), VAST_ARG(x));
   // Sanity check.
   if (dx.offset.empty())
@@ -118,39 +119,82 @@ fetch_indexer(const PartitionState& state, const attribute_extractor& ex,
   return nullptr;
 }
 
+template<typename PartitionState>
+evaluation_triples evaluate(const PartitionState& state, const expression& expr) {
+  evaluation_triples result;
+  // Pretend the partition is a table, and return fitted predicates for the
+  // partitions layout.
+  auto resolved = resolve(expr, state.combined_layout);
+  for (auto& kvp : resolved) {
+    // For each fitted predicate, look up the corresponding INDEXER
+    // according to the specified type of extractor.
+    auto& pred = kvp.second;
+    auto get_indexer_handle = [&](const auto& ext, const data& x) {
+      return state.fetch_indexer(ext, pred.op, x);
+    };
+    auto v = detail::overload(
+      [&](const attribute_extractor& ex, const data& x) {
+        return get_indexer_handle(ex, x);
+      },
+      [&](const data_extractor& dx, const data& x) {
+        return get_indexer_handle(dx, x);
+      },
+      [](const auto&, const auto&) {
+        return caf::actor{}; // clang-format fix
+      });
+    // Package the predicate, its position in the query and the required
+    // INDEXER as a "job description".
+    if (auto hdl = caf::visit(v, pred.lhs, pred.rhs))
+      result.emplace_back(kvp.first, curried(pred), std::move(hdl));
+  }
+  // Return the list of jobs, to be used by the EVALUATOR.
+  return result;
+}
+
 } // namespace
 
-caf::actor partition_state::indexer_at(size_t position) {
+// TODO: These wrapper functions aren't really necessary, we could just call
+// the ones from the anonymous namespace directly.
+caf::actor partition_state::indexer_at(size_t position) const {
   return vast::system::v2::indexer_at(*this, position);
 }
 
-caf::actor readonly_partition_state::indexer_at(size_t position) {
+caf::actor readonly_partition_state::indexer_at(size_t position) const {
   return vast::system::v2::indexer_at(*this, position);
 }
 
 caf::actor
 partition_state::fetch_indexer(const attribute_extractor& ex,
-                               relational_operator op, const data& x) {
+                               relational_operator op, const data& x) const {
   return vast::system::v2::fetch_indexer(*this, ex, op, x);
 }
 
 caf::actor
 readonly_partition_state::fetch_indexer(const attribute_extractor& ex,
-                                        relational_operator op, const data& x) {
+                                        relational_operator op, const data& x) const {
   return vast::system::v2::fetch_indexer(*this, ex, op, x);
 }
 
 caf::actor
 partition_state::fetch_indexer(const data_extractor& ex, relational_operator op,
-                               const data& x) {
+                               const data& x) const {
   return vast::system::v2::fetch_indexer(*this, ex, op, x);
 }
 
 caf::actor
 readonly_partition_state::fetch_indexer(const data_extractor& ex,
-                                        relational_operator op, const data& x) {
+                                        relational_operator op, const data& x) const {
   return vast::system::v2::fetch_indexer(*this, ex, op, x);
 }
+
+evaluation_triples partition_state::evaluate(const expression& expr) const {
+  return vast::system::v2::evaluate(*this, expr);
+}
+
+evaluation_triples readonly_partition_state::evaluate(const expression& expr) const {
+  return vast::system::v2::evaluate(*this, expr);
+}
+
 
 bool partition_selector::operator()(const vast::qualified_record_field& filter,
                                     const table_slice_column& x) const {
@@ -165,13 +209,23 @@ pack(flatbuffers::FlatBufferBuilder& builder, const partition_state& x) {
   if (!uuid)
     return uuid.error();
   std::vector<flatbuffers::Offset<fbs::QualifiedValueIndex>> indices;
-  for (const auto& kv : x.chunks) {
-    auto chunk = kv.second;
+  // Note that the deserialization code relies on the order of indexers within
+  // the flatbuffers being preserved.
+  // TODO: Assert that `indexers` and `combined_layout` are stored in the same
+  // order as well.
+  for (auto& [qf, actor] : x.indexers) {
+    auto actor_id = actor.id();
+    auto chunk_it = x.chunks.find(actor_id);
+    if (chunk_it == x.chunks.end())
+      return make_error(ec::logic_error,
+                        "No chunk for for actor id " + to_string(actor_id));
+    auto& chunk = chunk_it->second;
     // TODO: Can we somehow get rid of this copy?
     auto data = builder.CreateVector(
       reinterpret_cast<const uint8_t*>(chunk->data()), chunk->size());
-    auto type = builder.CreateString("FIXME: dummy_type");
-    auto fqf = builder.CreateString("FIXME: dummy_qualified_fieldname");
+    auto type = builder.CreateString(
+      "ValueIndex"); // TODO: read this from the actual type of the indexer
+    auto fqf = builder.CreateString(qf.field_name);
     fbs::ValueIndexBuilder vbuilder(builder);
     vbuilder.add_type(type);
     vbuilder.add_data(data);
@@ -184,33 +238,49 @@ pack(flatbuffers::FlatBufferBuilder& builder, const partition_state& x) {
   }
   auto indexes = builder.CreateVector(indices);
   // Serialize layout.
-  // FIXME: Create a generic function for arbitrary type -> flatbuffers byte
+  // TODO: Create a generic function for arbitrary type -> flatbuffers byte
   // array serialization. Or maybe `caf::serialize()` can already do the job.
   std::vector<char> buf;
-  caf::binary_serializer bs{
-    nullptr,
-    buf}; // FIXME: do we need to pass the current actor system as first arg?
-  inspect(bs, x.combined_layout);
+  caf::binary_serializer bs{nullptr, buf};
+  bs(x.combined_layout);
   auto layout_chunk = chunk::make(std::move(buf));
   auto combined_layout = builder.CreateVector(
     reinterpret_cast<const uint8_t*>(layout_chunk->data()),
     layout_chunk->size());
-  // auto layouts = ...; // FIXME
+  std::vector<flatbuffers::Offset<fbs::TypeIds>> tids;
+  for (const auto& kv : x.type_ids) {
+    auto name = builder.CreateString(kv.first);
+    buf.clear();
+    caf::binary_serializer bs{nullptr, buf};
+    bs(kv.second);
+    auto ids = builder.CreateVector(
+      reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+    fbs::TypeIdsBuilder tids_builder(builder);
+    tids_builder.add_name(name);
+    tids_builder.add_ids(ids);
+    tids.push_back(tids_builder.Finish());
+  }
+  auto type_ids = builder.CreateVector(tids);
+  auto name = builder.CreateString(x.name);
   fbs::PartitionBuilder partition_builder(builder);
   partition_builder.add_uuid(*uuid);
+  partition_builder.add_name(name);
   partition_builder.add_offset(x.offset);
   partition_builder.add_events(x.events);
   partition_builder.add_indexes(indexes);
   partition_builder.add_combined_layout(combined_layout);
+  partition_builder.add_type_ids(type_ids);
   return partition_builder.Finish();
 }
 
 caf::error
 unpack(const fbs::Partition& partition, readonly_partition_state& state) {
   // Check that all fields exist.
-  // TODO: We should also add a `Version` fields to the partitions.
   if (!partition.uuid())
     return make_error(ec::format_error, "missing 'uuid' field in partition "
+                                        "flatbuffer");
+  if (!partition.name())
+    return make_error(ec::format_error, "missing 'name' field in partition "
                                         "flatbuffer");
   auto combined_layout = partition.combined_layout();
   if (!combined_layout)
@@ -220,50 +290,98 @@ unpack(const fbs::Partition& partition, readonly_partition_state& state) {
   if (!indexes)
     return make_error(ec::format_error, "missing 'indexes' field in partition "
                                         "flatbuffer");
-  unpack(*partition.uuid(), state.partition_uuid);
+  for (auto qualified_index : *indexes) {
+    if (!qualified_index->qualified_field_name())
+      return make_error(ec::format_error, "missing field name in qualified "
+                                          "index");
+    auto index = qualified_index->index();
+    if (!index)
+      return make_error(ec::format_error, "missing index name in qualified "
+                                          "index");
+    if (!index->type())
+      return make_error(ec::format_error, "missing type in index");
+    if (!index->data())
+      return make_error(ec::format_error, "missing data in index");
+    if (index->type()->str() != "ValueIndex")
+      return make_error(ec::format_error, "unknown index type in flatbuffer");
+  }
+  auto error = unpack(*partition.uuid(), state.partition_uuid);
+  if (error)
+    return error;
   state.events = partition.events();
   state.offset = partition.offset();
-  caf::binary_deserializer bs(
-    state.self->system(),
-    reinterpret_cast<const char*>(combined_layout->data()),
+  state.name = partition.name()->str();
+  caf::binary_deserializer bds(
+    nullptr, reinterpret_cast<const char*>(combined_layout->data()),
     combined_layout->size());
-  bs >> state.combined_layout;
-  for (auto qualified_index : *indexes) {
-    // FIXME: Check that all fields exist (ideally in a separate pass before we
-    // start deserializing anything)
-    auto fqf = qualified_index->qualified_field_name();
+  error = bds(state.combined_layout);
+  if (error)
+    return error;
+  // TODO: This condition should be '==', but that breaks unit tests :/
+  if (state.combined_layout.fields.size() >= indexes->size())
+    return make_error(ec::format_error, "incoherent number of indexers");
+  // We rely on the indexes being stored in the same order as the layout
+  // fields, and need to preserve the same order in `indexer_states`.
+  state.indexer_states.resize(indexes->size());
+  for (size_t i = 0; i < indexes->size(); ++i) {
+    auto qualified_index = indexes->Get(i);
+    auto field = state.combined_layout.fields.at(i);
+    auto& indexer_state = state.indexer_states.at(i);
+    VAST_DEBUG("restoring indexer", i, "with name",
+               qualified_index->qualified_field_name()->str(), "and type",
+               field);
+    // Deserialize the value index.
+    indexer_state.first = qualified_record_field{
+      qualified_index->qualified_field_name()->str(), field};
     auto index = qualified_index->index();
-    auto type = index->type();
     auto data = index->data();
-    caf::binary_deserializer bs(state.self->system(),
-                                reinterpret_cast<const char*>(data->data()),
-                                data->size());
-    // FIXME:
-    // switch (type) {
-    // case ValueIndex:
-    //   ...
-    // }
+    auto& vindex_ptr = indexer_state.second;
+    caf::binary_deserializer bds(
+      nullptr, reinterpret_cast<const char*>(data->data()), data->size());
+    auto error = bds(vindex_ptr);
+    if (error)
+      return error;
   }
+  VAST_VERBOSE_ANON("restored", state.indexer_states.size(),
+                    "indexers for partition", state.partition_uuid);
+  auto type_ids = partition.type_ids();
+  for (size_t i = 0; i < type_ids->size(); ++i) {
+    auto type_ids_tuple = type_ids->Get(i);
+    auto name = type_ids_tuple->name();
+    auto ids_data = type_ids_tuple->ids();
+    auto& ids = state.type_ids[name->str()];
+    caf::binary_deserializer bds(
+      nullptr, reinterpret_cast<const char*>(ids_data->data()),
+      ids_data->size());
+    auto error = bds(ids);
+    if (error)
+      return error;
+  }
+  VAST_VERBOSE_ANON("restored", state.type_ids.size(),
+                    "type to ids mappings for partition", state.partition_uuid);
   return caf::none;
 }
 
-caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
+caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id,
+                        filesystem_type fs, caf::settings index_opts) {
   self->state.self = self;
   self->state.name = "partition-" + to_string(id);
   self->state.partition_uuid = id;
   self->state.offset = vast::invalid_id;
   self->state.events = 0;
+  self->state.fs_actor = fs;
+  self->state.streaming_initiated = false;
   // stream stage input: table_slice_ptr
   // stream stage output: table_slice_column
   self->state.stage = caf::attach_continuous_stream_stage(
-    self,
-    [=](caf::unit_t&) {
-      VAST_DEBUG(self, "initializes stream manager"); // clang-format fix
-    },
+    self, [=](caf::unit_t&) { VAST_DEBUG(self, "initializes stream manager"); },
     [=](caf::unit_t&, caf::downstream<table_slice_column>& out,
         table_slice_ptr x) {
       VAST_DEBUG(self, "got new table slice", to_string(*x));
-      // We rely on `invalid_id` being actually being the highest possible id
+      // TODO: putting this line in the handshake message should be enough, but
+      // for some reason it is not :( Why?
+      self->state.streaming_initiated = true;
+      // We rely on `invalid_id` actually being the highest possible id
       // when using `min()` below.
       VAST_ASSERT(vast::invalid_id == std::numeric_limits<vast::id>::max());
       auto first = x->offset();
@@ -277,13 +395,13 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
       self->state.offset = std::min(x->offset(), self->state.offset);
       self->state.events += x->rows();
       size_t col = 0;
+      VAST_ASSERT(!x->layout().fields.empty());
       for (auto& field : x->layout().fields) {
         auto qf = qualified_record_field{x->layout().name(), field};
         auto& idx = self->state.indexers[qf];
         if (!idx) {
           self->state.combined_layout.fields.push_back(as_record_field(qf));
-          // FIXME: properly initialize settings
-          idx = self->spawn(indexer, field.type, caf::settings{});
+          idx = self->spawn(indexer, field.type, index_opts);
           auto slot = self->state.stage->add_outbound_path(idx);
           self->state.stage->out().set_filter(slot, qf);
           VAST_DEBUG(self, "spawned new indexer for field", field.name,
@@ -293,17 +411,23 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
       }
     },
     [=](caf::unit_t&, const caf::error& err) {
-      if (err) {
-        VAST_ERROR(self, "aborted with error", self->system().render(err));
+      // We get an 'unreachable' error when the stream becomes unreachable
+      // because the actor was destroyed; in this case we can't use `self`
+      // anymore.
+      if (err
+          && caf::exit_reason{err.code()} != caf::exit_reason::unreachable) {
+        VAST_ERROR(self, "was aborted with error", self->system().render(err));
         self->send_exit(self, err);
       }
-      VAST_DEBUG(self, "finalized streaming");
+      VAST_DEBUG_ANON("partition", id, "finalized streaming");
     },
-    // Every "outbound path" (maybe also inbound?) has a path_state, which
-    // consists of a "Filter" and a vector of "T", the output buffer.
-    // T = table_slice_column
-    // Filter = vast::qualified_record_field
-    // Select = partition_selector
+    // Every "outbound path" has a path_state, which consists of a "Filter"
+    // and a vector of "T", the output buffer. In the case of a partition,
+    // we have:
+    //   T:      vast::table_slice_column
+    //   Filter: vast::qualified_record_field
+    //   Select: vast::system::partition_selector
+    //
     // NOTE: The broadcast_downstream_manager has to iterate over all
     // indexers, and compute the qualified record field name for each. A
     // specialized downstream manager could optimize this by using e.g. a map
@@ -313,24 +437,33 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
   self->set_exit_handler([=](const caf::exit_msg& msg) {
     VAST_DEBUG(self, "received EXIT from", msg.source,
                "with reason:", msg.reason);
+    if (self->state.stage->idle()) {
+      self->state.stage->out().fan_out_flush();
+      self->state.stage->out().force_emit_batches();
+      self->state.stage->out().close();
+    }
     // Delay shutdown if we're currently in the process of persisting.
     if (self->state.persistence_promise.pending()) {
-      VAST_INFO(self, "delaying partition shutdown because persistion is in "
-                      "progress");
+      VAST_INFO(self, "delaying partition shutdown because its still writing "
+                      "to disk");
       self->delayed_send(self, std::chrono::milliseconds(50), msg);
       return;
     }
-    self->state.stage->out().fan_out_flush();
-    self->state.stage->out().force_emit_batches();
-    self->state.stage->out().close();
     auto indexers = std::vector<caf::actor>{};
-    for ([[maybe_unused]] auto& [_, idx] : self->state.indexers)
+    auto indexer_ids = std::vector<caf::actor_id>{};
+
+    for ([[maybe_unused]] auto& [_, idx] : self->state.indexers) {
       indexers.push_back(idx);
+      indexer_ids.push_back(idx->id());
+    }
+    for (auto id : indexer_ids)
+      std::cerr << id << ", ";
+    std::cerr << std::endl;
+    self->state.indexers.clear();
     shutdown<policy::parallel>(self, std::move(indexers));
   });
   return {
     [=](caf::stream<table_slice_ptr> in) {
-      VAST_DEBUG(self, "got a new table slice stream");
       return self->state.stage->add_inbound_path(in);
     },
     [=](atom::persist, const path& part_dir) {
@@ -345,49 +478,55 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
       // `persist_stage2` atom when finalizing the stream, but then the case
       // where the stream finishes before persisting starts becomes more
       // complicated.
-      if (!self->state.stage->idle()) {
-        VAST_INFO(self, "waiting for stream before persisting");
+      if (!self->state.streaming_initiated || !self->state.stage->idle()) {
+        VAST_INFO(
+          self,
+          "waiting for stream before persisting");
         self->delayed_send(self, 50ms, atom::persist_v, part_dir);
-        return;
+        return st.persistence_promise;
       }
-      VAST_INFO(self, "sending `snapshot` to indexers");
+      self->state.stage->out().fan_out_flush();
+      self->state.stage->out().force_emit_batches();
+      self->state.stage->out().close();
+      if (st.indexers.empty()) {
+        st.persistence_promise.deliver(
+          make_error(ec::logic_error, "partition has no indexers"));
+        return st.persistence_promise;
+      }
+      VAST_VERBOSE(self, "sending 'snapshot' atom to", st.indexers.size(),
+                   "indexers");
       for (auto& kv : st.indexers) {
-        self->send(kv.second, atom::snapshot_v,
-                   caf::actor_cast<caf::actor>(self));
+        self->send(kv.second, atom::snapshot_v);
       }
+      return st.persistence_promise;
     },
-    [=](atom::done, vast::chunk_ptr chunk) {
+    // Semantically this is the "response" to the "request" represented by the
+    // snapshot atom.
+    [=](vast::chunk_ptr chunk) {
       ++self->state.persisted_indexers;
       if (!chunk) {
         // TODO: If one indexer reports an error, should we abandon the
         // whole partition or still persist the remaining chunks?
-        VAST_ERROR(self,
-                   "cant persist an indexer"); // FIXME: send error message
+        VAST_ERROR(self, "cant persist an indexer");
         return;
       }
       auto sender = self->current_sender()->id();
-      VAST_INFO(self, "got chunk from", sender); // FIXME: info -> debug
-      // TODO: We technically dont need the `state.chunks` map, we can just put
-      // the builder in the state and add new chunks as they arrive.
+      VAST_DEBUG(self, "got chunk from", sender);
       self->state.chunks.emplace(sender, chunk);
-      if (self->state.persisted_indexers < self->state.indexers.size())
+      if (self->state.persisted_indexers < self->state.indexers.size()) {
+        VAST_DEBUG(self, "waiting for more chunks, got",
+                   self->state.persisted_indexers, "need",
+                   self->state.indexers.size());
         return;
+      }
       flatbuffers::FlatBufferBuilder builder;
       auto partition = pack(builder, self->state);
       if (!partition) {
         VAST_ERROR(self, "error serializing partition", self->state.name);
+        self->state.persistence_promise.deliver(partition.error());
         return;
       }
       builder.Finish(*partition);
-      // Delegate I/O to filesystem actor.
-      // TODO: Store the actor handle in `state`.
-      auto actor = self->system().registry().get(atom::filesystem_v);
-      if (!actor) {
-        VAST_ERROR(self, "cannot persist state; filesystem actor is "
-                         "already down");
-        return; // FIXME: send error message
-      }
-      auto fs = caf::actor_cast<filesystem_type>(actor);
       VAST_ASSERT(self->state.persist_path);
       auto fb = builder.Release();
       // TODO: This is duplicating code from one of the `chunk` constructors,
@@ -398,41 +537,14 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
       auto fbchunk = chunk::make(ys->size(), ys->data(), deleter);
       VAST_VERBOSE(self, "persisting partition with total size", ys->size(),
                    "bytes");
-      self->state.persistence_promise.delegate(
-        fs, atom::write_v, *self->state.persist_path, fbchunk);
-      return; // FIXME: send error message
+      self->state.persistence_promise.delegate(self->state.fs_actor,
+                                               atom::write_v,
+                                               *self->state.persist_path,
+                                               fbchunk);
+      return;
     },
     [=](atom::evaluate, const expression& expr) {
-      evaluation_triples result;
-      VAST_INFO(self, "evaluating expression", expr);
-      // Pretend the partition is a table, and return fitted predicates for the
-      // partitions layout.
-      auto resolved = resolve(expr, self->state.combined_layout);
-      for (auto& kvp : resolved) {
-        // For each fitted predicate, look up the corresponding INDEXER
-        // according to the specified type of extractor.
-        auto& pred = kvp.second;
-        auto get_indexer_handle = [&](const auto& ext, const data& x) {
-          return self->state.fetch_indexer(ext, pred.op, x);
-        };
-        auto v = detail::overload(
-          [&](const attribute_extractor& ex, const data& x) {
-            return get_indexer_handle(ex, x);
-          },
-          [&](const data_extractor& dx, const data& x) {
-            return get_indexer_handle(dx, x);
-          },
-          [](const auto&, const auto&) {
-            return caf::actor{}; // clang-format fix
-          });
-        // Package the predicate, its position in the query and the required
-        // INDEXER as a "job description".
-        if (auto hdl = caf::visit(v, pred.lhs, pred.rhs))
-          result.emplace_back(kvp.first, curried(pred), std::move(hdl));
-      }
-      // Return the list of jobs, to be used by the EVALUATOR.
-      VAST_INFO(self, "result is", result);
-      return result;
+      return self->state.evaluate(expr);
     },
   };
 }
@@ -440,10 +552,45 @@ caf::behavior partition(caf::stateful_actor<partition_state>* self, uuid id) {
 caf::behavior
 readonly_partition(caf::stateful_actor<readonly_partition_state>* self, uuid id,
                    vast::chunk chunk) {
+  self->state.self = self;
   auto partition = fbs::GetPartition(chunk.data());
+  if (!partition) {
+    VAST_ERROR(self, "could not parse provided chunk as flatbuffer");
+    self->quit(make_error(ec::format_error, "chunk did not contain valid "
+                                            "partition flatbuffer"));
+    return {};
+  }
   auto error = unpack(*partition, self->state);
-  VAST_ASSERT(!error); // FIXME: Proper error handling.
-  VAST_ASSERT(id == self->state.partition_uuid);
+  if (error) {
+    VAST_ERROR(self, "error unpacking partition", error);
+    self->quit(error);
+    return {};
+  }
+  if (id != self->state.partition_uuid) {
+    VAST_WARNING(self, "partition id mismatch: restored",
+                 self->state.partition_uuid, "from disk, expected", id);
+  }
+  for (auto& kv : self->state.indexer_states) {
+    auto field = kv.first;
+    // Note that we rely on `self->state.indexers` always keeping elements in
+    // insertion order in the underlying vector.
+    self->state.indexers[field]
+      = self->spawn(readonly_indexer, id, std::move(kv.second));
+  }
+  self->set_exit_handler([=](const caf::exit_msg& msg) {
+    VAST_DEBUG(self, "received EXIT from", msg.source,
+               "with reason:", msg.reason);
+    auto indexers = std::vector<caf::actor>{};
+    for ([[maybe_unused]] auto& [_, idx] : self->state.indexers) {
+      indexers.push_back(idx);
+    }
+    // FIXME: Use `terminate()` here to avoid killing the process.
+    // NOTE: We technically don't need to kill the indexers at all here, since
+    // caf's ref-counting should do the trick for us. On the other hand, that
+    // introduces funny bugs where e.g. the telemetry handler is keeping the
+    // ref-count high and prevents shutdown.
+    shutdown<policy::parallel>(self, std::move(indexers));
+  });
   return {
     [=](caf::stream<table_slice_ptr>) {
       VAST_ASSERT(!"read-only partition can not receive new table slices");
@@ -452,39 +599,8 @@ readonly_partition(caf::stateful_actor<readonly_partition_state>* self, uuid id,
       // Technically we could also return `ok` immediately.
       VAST_ASSERT(!"read-only partition does not need to be persisted");
     },
-    // FIXME: This handler is copied from the regular `partition()` behaviour,
-    // this should be unified into one function.
     [=](atom::evaluate, const expression& expr) {
-      evaluation_triples result;
-      VAST_INFO(self, "evaluating expression", expr);
-      // Pretend the partition is a table, and return fitted predicates for the
-      // partitions layout.
-      auto resolved = resolve(expr, self->state.combined_layout);
-      for (auto& kvp : resolved) {
-        // For each fitted predicate, look up the corresponding INDEXER
-        // according to the specified type of extractor.
-        auto& pred = kvp.second;
-        auto get_indexer_handle = [&](const auto& ext, const data& x) {
-          return self->state.fetch_indexer(ext, pred.op, x);
-        };
-        auto v = detail::overload(
-          [&](const attribute_extractor& ex, const data& x) {
-            return get_indexer_handle(ex, x);
-          },
-          [&](const data_extractor& dx, const data& x) {
-            return get_indexer_handle(dx, x);
-          },
-          [](const auto&, const auto&) {
-            return caf::actor{}; // clang-format fix
-          });
-        // Package the predicate, its position in the query and the required
-        // INDEXER as a "job description".
-        if (auto hdl = caf::visit(v, pred.lhs, pred.rhs))
-          result.emplace_back(kvp.first, curried(pred), std::move(hdl));
-      }
-      // Return the list of jobs, to be used by the EVALUATOR.
-      VAST_INFO(self, "result is", result);
-      return result;
+      return self->state.evaluate(expr);
     },
   };
 }

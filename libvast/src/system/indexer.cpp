@@ -26,6 +26,7 @@
 #include "vast/path.hpp"
 #include "vast/system/accountant.hpp"
 #include "vast/system/instrumentation.hpp"
+#include "vast/system/partition.hpp"
 #include "vast/system/report.hpp"
 #include "vast/table_slice_column.hpp"
 #include "vast/value_index.hpp"
@@ -34,8 +35,9 @@
 #include <caf/attach_stream_sink.hpp>
 
 #include "caf/binary_serializer.hpp"
-
-// #include "caf/serializer_impl.hpp"
+#include "caf/response_promise.hpp"
+#include "caf/skip.hpp"
+#include "caf/stateful_actor.hpp"
 
 #include <flatbuffers/flatbuffers.h>
 
@@ -45,24 +47,58 @@ namespace vast::system {
 
 namespace v2 {
 
+namespace {
+
+vast::chunk_ptr chunkify(const value_index_ptr& idx) {
+  std::vector<char> buf;
+  caf::binary_serializer sink{nullptr, buf};
+  auto error = sink(idx);
+  if (error)
+    return nullptr;
+  return chunk::make(std::move(buf));
+}
+
+} // namespace
+
+caf::behavior readonly_indexer(caf::stateful_actor<indexer_state>* self,
+                               uuid partition_id, value_index_ptr idx) {
+  self->state.name = "indexer-" + to_string(idx->type());
+  self->state.partition_id = partition_id;
+  self->state.idx = std::move(idx);
+  return {
+    [=](caf::stream<table_slice_column>) {
+      VAST_ASSERT(!"received incoming stream as read-only indexer");
+    },
+    [=](atom::snapshot) {
+      VAST_ASSERT(!"received snapshot request as read-only indexer");
+    },
+    [=](const curried_predicate& pred) {
+      VAST_DEBUG(self, "got predicate:", pred);
+      return self->state.idx->lookup(pred.op, make_view(pred.rhs));
+    },
+    [=](atom::shutdown) { self->quit(caf::exit_reason::user_shutdown); },
+  };
+}
+
 caf::behavior indexer(caf::stateful_actor<indexer_state>* self, type index_type,
                       caf::settings index_opts) {
   self->state.name = "indexer-" + to_string(index_type);
   return {
     [=](caf::stream<table_slice_column> in) {
-      VAST_DEBUG(self, "got a new table slice stream");
+      VAST_DEBUG(self, "received new table slice stream");
       return caf::attach_stream_sink(
         self, in,
         [=](caf::unit_t&) {
           self->state.idx = factory<value_index>::make(index_type, index_opts);
           if (!self->state.idx) {
             VAST_ERROR(self, "failed to construct index");
-            self->quit(); // TODO: choose right error code.
+            self->quit(make_error(ec::invalid_argument, "failed to construct "
+                                                        "index"));
           }
         },
         [=](caf::unit_t&, const std::vector<table_slice_column>& xs) {
-          // TODO: assert that this indexer has not yet been serialized
           VAST_ASSERT(self->state.idx != nullptr);
+          self->state.stream_initiated = true;
           for (auto& x : xs) {
             for (size_t i = 0; i < x.slice->rows(); ++i) {
               auto v = x.slice->at(i, x.column);
@@ -71,36 +107,45 @@ caf::behavior indexer(caf::stateful_actor<indexer_state>* self, type index_type,
           }
         },
         [=](caf::unit_t&, const error& err) {
-          if (err && err != caf::exit_reason::user_shutdown) {
-            VAST_ERROR(self, "got a stream error:", self->system().render(err));
+          if (err) {
+            // Exit reason `user_shutdown` means that the actor has exited,
+            // so we can't use `self` anymore.
+            if (err == caf::exit_reason::user_shutdown)
+              VAST_ERROR_ANON("indexer got a stream error:", err);
+            else
+              VAST_ERROR(self,
+                         "got a stream error:", self->system().render(err));
             return;
           }
-          self->quit(err);
+          if (self->state.promise.pending())
+            self->state.promise.deliver(chunkify(self->state.idx));
         });
     },
-    // FIXME: Get rid of one of these handler, i think the bottom one is
-    // currently unused.
     [=](const curried_predicate& pred) {
       VAST_DEBUG(self, "got predicate:", pred);
-      return self->state.idx->lookup(pred.op, make_view(pred.rhs));
+      VAST_ASSERT(self->state.idx);
+      auto& idx = *self->state.idx;
+      auto rep = to_internal(idx.type(), make_view(pred.rhs));
+      return idx.lookup(pred.op, rep);
     },
-    [=](relational_operator op, const data_view& rhs) {
-      VAST_DEBUG(self, "got query for:", op, to_string(rhs));
-      return self->state.idx->lookup(op, rhs);
+    [=](atom::snapshot) {
+      // The partition is only allowed to send a single snapshot atom.
+      VAST_ASSERT(
+        !self->state.promise.pending());
+      self->state.promise = self->make_response_promise();
+      // Checking 'idle()' is not enough, since we emprically can
+      // have data that was flushed in the upstream stage but is not
+      // yet visible to the sink.
+      if (self->state.stream_initiated
+          && (self->stream_managers().empty()
+              || self->stream_managers().begin()->second->done())) {
+        self->state.promise.deliver(chunkify(self->state.idx));
+      }
+      return self->state.promise;
     },
-    [=](atom::snapshot, caf::actor receiver) {
-      std::vector<char> buf;
-      caf::binary_serializer bs{
-        nullptr,
-        buf}; // TODO: do we need to pass the current actor system as first arg?
-      inspect(bs, self->state.idx);
-      auto chunk = chunk::make(std::move(buf));
-      auto sender = self->current_sender();
-      self->send(receiver, atom::done_v, chunk);
-    },
-    [=](atom::shutdown) {
-      self->quit(caf::exit_reason::user_shutdown); // clang-format fix
-    },
+    // [=](atom::shutdown) {
+    //   self->quit(caf::exit_reason::user_shutdown); // clang-format fix
+    // },
   };
 }
 

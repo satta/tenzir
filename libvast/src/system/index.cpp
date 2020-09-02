@@ -66,92 +66,106 @@ using namespace std::chrono;
 
 // clang-format off
 //
-//            table slice              table slice                           table slice column
-// importer ----------------> index ---------------> active partition ----------------------------> indexer1
-//                                                                    ----------------------------> indexer2
+// The index is implemented as a stream stage that hooks into the table slice
+// stream coming from the importer, and forwards them to the current active
+// partition
+//
+//              table slice              table slice                      table slice column
+//   importer ----------------> index ---------------> active partition ------------------------> indexer
+//                                                                      ------------------------> indexer
 //                                                                                ...
+//
+// At the same time, the index is also involved in the lookup path, where it
+// receives an expression and loads the partitions that might contain relevant
+// results into memory.
+//
+//      expression                atom::evaluate
+//     ------------>  index     ----------------->   partition
+//
+//                                   [indexer]
+//                  (spawns     <----------------     
+//                   evaluator) 
+//
+//                                  curried_predicate
+//                   evaluator  -------------------------------> indexer
+//
+//                                            ids
+//                              <------------------------------
 // clang-format on
 
 namespace vast::system {
 
 namespace v2 {
 
-index_state::index_state(caf::stateful_actor<index_state>* self)
-  : self(self), lru_partitions(0, partition_factory{this}) {
-}
-
-caf::actor index_state::partition_factory::operator()(const uuid& id) const {
+caf::actor partition_factory::operator()(const uuid& id) const {
   // Load partition from disk.
-  VAST_ASSERT(std::find(st_->persisted_partitions.begin(),
-                        st_->persisted_partitions.end(), id)
-              != st_->persisted_partitions.end());
-  auto path = st_->dir / to_string(id);
-  VAST_INFO(st_->self, "loads partition", id, "from path",
-            path); // fixme: info -> debug
-  // FIXME: Delegate I/O to filesystem actor.
+  VAST_ASSERT(std::find(state_.persisted_partitions.begin(),
+                        state_.persisted_partitions.end(), id)
+              != state_.persisted_partitions.end());
+  auto path = state_.dir / to_string(id);
+  VAST_DEBUG(state_.self, "loads partition", id, "from path", path);
+  // TODO: Don't read the partition eagerly here, just verify that the file
+  // exists and pass the path to the partition actor constructor.
   auto bytes = io::read(path);
   if (!bytes)
     return nullptr;
   auto chunk = chunk::make(std::move(*bytes));
   if (!chunk)
     return nullptr;
-  return st_->self->spawn(readonly_partition, id, *chunk);
+  return state_.self->spawn(readonly_partition, id, *chunk);
+}
+
+index_state::index_state(caf::stateful_actor<index_state>* self)
+  : self{self}, lru_partitions{0, partition_factory{*this}} {
 }
 
 caf::error index_state::load_from_disk() {
-  // TODO: Not sure if we should already use the filesystem actor here,
-  // this function is only once used during startup so it seems like
-  // unnecessary
+  // We dont use the filesystem actor here because this function is only
+  // called once during startup, when no other actors exist yet.
   if (!exists(dir)) {
     VAST_INFO(self, "found no prior state, starting with clean slate");
     return caf::none;
   }
-  // TODO: Move the `statistics` into the flatbuffer.
-  if (auto fname = statistics_filename(); exists(fname)) {
-    VAST_VERBOSE(self, "loads statistics from", fname);
-    if (auto err = load(&self->system(), fname, stats)) {
-      VAST_ERROR(self,
-                 "failed to load statistics:", self->system().render(err));
-      return err;
-    }
-    VAST_DEBUG(self, "loaded statistics");
-  }
   if (auto fname = index_filename(); exists(fname)) {
-    VAST_INFO(self, "loads index from", fname); // FIXME: info -> verbose
+    VAST_VERBOSE(self, "loads state from", fname);
     auto buffer = io::read(fname);
     if (!buffer) {
       VAST_ERROR(self, "failed to read index file:",
                  self->system().render(buffer.error()));
       return buffer.error();
     }
-    // FIXME: This part of the code into an `unpack()` function.
+    // TODO: Create a `index_ondisk_state` struct and move this part of the
+    // code into an `unpack()` function.
     auto index = fbs::GetIndex(buffer->data());
     auto version = index->version();
-    if (version != fbs::Version::v0) {
-      vast::die("unsupported index version, either remove the existing vast.db "
-                "or try again with a newer version of VAST");
-    }
+    if (version != fbs::Version::v0)
+      return make_error(ec::format_error, "unsupported index version, either remove the existing vast.db "
+                "directory or try again with a newer version of VAST");
     auto meta_idx = index->meta_index();
     VAST_ASSERT(meta_idx);
-    unpack(*meta_idx, this->meta_idx); // FIXME: check return value
+    auto error = unpack(*meta_idx, this->meta_idx);
+    if (error)
+      return error;
     auto partition_uuids = index->partitions();
     VAST_ASSERT(partition_uuids);
-    VAST_INFO(self, "loaded partition ids", partition_uuids->size());
     for (auto uuid_fb : *partition_uuids) {
       VAST_ASSERT(uuid_fb);
       vast::uuid partition_uuid;
       unpack(*uuid_fb, partition_uuid);
-      VAST_INFO(self, "unpacked", partition_uuid);
-      // FIXME: Check if the partition with that uuid actually exists on disk,
-      // and throw it out with a warning if not. (this can easily happen e.g.
-      // with a hard shutdown)
       if (exists(dir / to_string(partition_uuid)))
-        persisted_partitions.push_back(partition_uuid);
+        persisted_partitions.insert(partition_uuid);
       else
         // TODO: remove the problematic uuid from the meta index if we get here
         VAST_WARNING(self, "found partition", partition_uuid,
-                     "in the index state but not on disk. If the last shutdown "
-                     "was not clean, data may have been lost");
+                     "in the index state but not on disk. This may have been "
+                     "caused b");
+    }
+    auto stats = index->stats();
+    if (!stats)
+      return make_error(ec::format_error, "No stats in index flatbuffer");
+    for (const auto& stat : *stats) {
+      this->stats.layouts[stat->name()->str()]
+        = layout_statistics{stat->count()};
     }
   } else {
     VAST_WARNING(self, "found existing database dir", dir,
@@ -169,6 +183,50 @@ bool index_state::worker_available() {
 caf::actor index_state::next_worker() {
   auto result = std::move(idle_workers.back());
   idle_workers.pop_back();
+  return result;
+}
+
+void index_state::add_flush_listener(caf::actor listener) {
+  VAST_DEBUG(self, "adds a new 'flush' subscriber:", listener);
+  flush_listeners.emplace_back(std::move(listener));
+  detail::notify_listeners_if_clean(*this, *stage);
+}
+
+void index_state::notify_flush_listeners() {
+  VAST_DEBUG(self, "sends 'flush' messages to", flush_listeners.size(),
+             "listeners");
+  for (auto& listener : flush_listeners)
+    self->send(listener, atom::flush_v);
+  flush_listeners.clear();
+}
+
+caf::dictionary<caf::config_value> index_state::status() const {
+  using caf::put_dictionary;
+  using caf::put_list;
+  caf::dictionary<caf::config_value> result;
+  // Statistics.
+  auto& stats_object = put_dictionary(result, "statistics");
+  auto& layout_object = put_dictionary(stats_object, "layouts");
+  for (auto& [name, layout_stats] : stats.layouts) {
+    auto xs = caf::dictionary<caf::config_value>{};
+    xs.emplace("count", layout_stats.count);
+    // We cannot use put_dictionary(layout_object, name) here, because this
+    // function splits the key at '.', which occurs in every layout name.
+    // Hence the fallback to low-level primitives.
+    layout_object.insert_or_assign(name, std::move(xs));
+  }
+  // Resident partitions.
+  auto& partitions = put_dictionary(result, "partitions");
+  if (active_partition.actor != nullptr)
+    partitions.emplace("active", to_string(active_partition.id));
+  auto& cached = put_list(partitions, "cached");
+  for (auto& kv : lru_partitions)
+    cached.emplace_back(to_string(kv.first));
+  auto& unpersisted = put_list(partitions, "unpersisted");
+  for (auto& kv : this->unpersisted)
+    unpersisted.emplace_back(to_string(kv.first));
+  // General state such as open streams.
+  detail::fill_status_map(result, self);
   return result;
 }
 
@@ -196,19 +254,20 @@ void index_state::request_query_map(query_state& lookup,
       part = active_partition.actor;
     else if (auto it = unpersisted.find(partition_id); it != unpersisted.end())
       part = it->second;
-    else
-      // TODO: Add a way for the cache to return an error, and pass it on to
-      // the caller.
+    else if (auto it = persisted_partitions.find(partition_id);
+             it != persisted_partitions.end())
       part = lru_partitions.get_or_load(partition_id);
     if (!part) {
       VAST_ERROR("Could not load partition", partition_id,
                  "that was part of a query");
       return false;
     }
-    // FIXME: send all requests before blocking on the responses
+    // Note that `.await()` doesnt block until after the handler returns.
+    // FIXME: I think a better design is request() -> then() -> send
+    // atom::resume with the created pending_query_map as param
     self->request(part, caf::infinite, atom::evaluate_v, lookup.expression)
       .await(
-        [&](evaluation_triples triples) {
+        [=, &lookup](evaluation_triples triples) {
           if (triples.empty()) {
             VAST_DEBUG(self, "identified partition", partition_id,
                        "as candidate in the meta index, but it didn't produce "
@@ -218,15 +277,15 @@ void index_state::request_query_map(query_state& lookup,
           }
           lookup.pqm.emplace(partition_id, std::move(triples));
         },
-        [&](const caf::error& error) {
-          VAST_ERROR("oh no :(", error);
-        }); // FIXME
+        [=](const caf::error& error) {
+          VAST_ERROR(self, "failed to request evaluation map", error);
+        });
     return true;
   };
   // Loop over the candidate set until we either successfully scheduled
   // num_partitions partitions or run out of candidates.
   //
-  // TODO: The previous code immediately discarded partitions that were
+  // NOTE: The previous code immediately discarded partitions that were
   // selected by the meta index but didnt produce an evaluation map, so
   // that they didn't count towards the minimum. This is kinda hard to
   // replicate in the new asynchronous scenario, but if it turns out to
@@ -246,110 +305,106 @@ void index_state::request_query_map(query_state& lookup,
 }
 
 query_map
-index_state::launch_evaluators(pending_query_map pqm, expression expr) {
+index_state::launch_evaluators(pending_query_map& pqm, expression expr) {
   query_map result;
   for (auto& [id, eval] : pqm) {
     std::vector<caf::actor> xs{self->spawn(evaluator, expr, std::move(eval))};
     result.emplace(id, std::move(xs));
   }
+  pqm.clear();
   return result;
-}
-
-path index_state::statistics_filename(path basename) const {
-  return basename / dir / "statistics";
 }
 
 path index_state::index_filename(path basename) const {
   return basename / dir / "index.bin";
 }
 
-// FIXME: Move this code into a function `pack(builder, index)`.
-caf::error index_state::flush_index() {
-  flatbuffers::FlatBufferBuilder builder;
-  auto meta_idx = pack(builder, self->state.meta_idx);
-  std::vector<flatbuffers::Offset<fbs::UUID>> partition_uuids;
-  VAST_INFO(self, "persisting", persisted_partitions.size(),
-            " definitely persisted and ", unpersisted.size(),
-            " maybe persisted partitions uuids");
-  for (auto uuid : persisted_partitions) {
+caf::expected<flatbuffers::Offset<fbs::Index>>
+pack(flatbuffers::FlatBufferBuilder& builder, const index_state& state) {
+  auto meta_idx = pack(builder, state.meta_idx);
+  if (!meta_idx)
+    return meta_idx.error();
+  VAST_VERBOSE(state.self, "persisting", state.persisted_partitions.size(),
+               " definitely persisted and ", state.unpersisted.size(),
+               " maybe persisted partitions uuids");
+  std::vector<flatbuffers::Offset<fbs::UUID>> partition_offsets;
+  for (auto uuid : state.persisted_partitions) {
     auto uuid_fb = pack(builder, uuid);
     if (!uuid_fb)
       return uuid_fb.error();
-    partition_uuids.push_back(*uuid_fb);
+    partition_offsets.push_back(*uuid_fb);
   }
   // We don't know if these will make it to disk before the index and the rest
   // of the system is shut down (in case of a hard/dirty shutdown), so we just
   // store everything and throw out the missing partitions when loading the
   // index.
-  for (auto& kv : unpersisted) {
+  for (auto& kv : state.unpersisted) {
     auto uuid_fb = pack(builder, kv.first);
     if (!uuid_fb)
       return uuid_fb.error();
-    partition_uuids.push_back(*uuid_fb);
+    partition_offsets.push_back(*uuid_fb);
   }
-  auto partitions = builder.CreateVector(partition_uuids);
-  if (!meta_idx)
-    return meta_idx.error();
+  auto partitions = builder.CreateVector(partition_offsets);
+  std::vector<flatbuffers::Offset<fbs::LayoutStatistics>> stats_offsets;
+  for (auto& [name, layout_stats] : state.stats.layouts) {
+    auto name_fb = builder.CreateString(name);
+    fbs::LayoutStatisticsBuilder stats_builder(builder);
+    stats_builder.add_name(name_fb);
+    stats_builder.add_count(layout_stats.count);
+    auto offset = stats_builder.Finish();
+    stats_offsets.push_back(offset);
+  }
+  auto stats = builder.CreateVector(stats_offsets);
   fbs::IndexBuilder index_builder(builder);
   index_builder.add_version(fbs::Version::v0);
   index_builder.add_meta_index(*meta_idx);
   index_builder.add_partitions(partitions);
-  auto index = index_builder.Finish();
-  // FIME: Move the file identifier (VAST) into a dedicated constant.
-  builder.Finish(index, "VAST");
-  auto span = vast::span<const byte>{
-    reinterpret_cast<const byte*>(builder.GetBufferPointer()),
-    builder.GetSize()};
-  // TODO: Use filesystem actor here?
-  io::write(index_filename(), span);
-  return caf::none;
-}
-
-caf::error index_state::flush_statistics() {
-  VAST_VERBOSE(self, "writes statistics to", statistics_filename());
-  return save(&self->system(), statistics_filename(), stats);
+  index_builder.add_stats(stats);
+  return index_builder.Finish();
 }
 
 /// Persists the state to disk.
-/// TODO: Should this be handled asynchronously/by the fs actor?
+// TODO: This function should delegate the actual writing of the data to the
+// filesystem actor, in order to not block the ingest path.
 caf::error index_state::flush_to_disk() {
-  VAST_TRACE("");
-  auto flush_all = [this]() -> caf::error {
-    // Flush statistics to disk.
-    if (auto err = flush_statistics())
-      return err;
-    // Flush index to disk.
-    if (auto err = flush_index())
-      return err;
-    // Success.
-    return caf::none;
-  };
-  if (auto err = flush_all()) {
-    VAST_ERROR(self, "failed to flush state:", self->system().render(err));
-    return err;
-  }
-  return caf::none;
+  flatbuffers::FlatBufferBuilder builder;
+  auto index = pack(builder, *this);
+  if (!index)
+    return index.error();
+  builder.Finish(*index, vast::fbs::file_identifier);
+  auto span = vast::span<const byte>{
+    reinterpret_cast<const byte*>(builder.GetBufferPointer()),
+    builder.GetSize()};
+  return io::save(index_filename(), span);
 }
 
-caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
-                    size_t partition_capacity, size_t in_mem_partitions,
-                    size_t taste_partitions, size_t num_workers) {
+caf::behavior
+index(caf::stateful_actor<index_state>* self, filesystem_type fs, path dir,
+      size_t partition_capacity, size_t in_mem_partitions,
+      size_t taste_partitions, size_t num_workers) {
   VAST_VERBOSE(self, "initializes index in", dir);
   VAST_VERBOSE(self, "caps partition size at", partition_capacity, "events");
   // Set members.
   self->state.self = self;
+  self->state.fs_actor = fs;
   self->state.dir = dir;
+  self->state.partition_capacity = partition_capacity;
+  self->state.taste_partitions = taste_partitions;
+  self->state.lru_partitions.resize(in_mem_partitions);
   // Read persistent state.
   if (auto err = self->state.load_from_disk()) {
-    vast::die("Cannot load index state from disk, please try again or remove "
-              "it to start with a clean state (after making a backup");
+    VAST_ERROR(self, "cannot load index state from disk:", err);
+    VAST_ERROR_ANON("Please try again or remove "
+                    "it to start with a clean state (after making a backup");
+    self->quit(err);
+    return {};
   }
-  self->state.lru_partitions.resize(in_mem_partitions);
-  self->state.taste_partitions = taste_partitions;
   // Creates a new active partition and updates index state.
   auto create_active_partition = [=] {
     auto id = uuid::random();
-    auto part = self->spawn(partition, id);
+    caf::settings index_opts;
+    index_opts["cardinality"] = partition_capacity;
+    auto part = self->spawn(partition, id, self->state.fs_actor, index_opts);
     auto slot = self->state.stage->add_outbound_path(part);
     self->state.active_partition.actor = part;
     self->state.active_partition.stream_slot = slot;
@@ -359,24 +414,25 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
   };
   auto decomission_active_partition = [=] {
     auto& active = self->state.active_partition;
-    self->state.unpersisted[active.id] = active.actor;
+    auto id = active.id;
+    self->state.unpersisted[id] = active.actor;
     // Send buffered batches.
     self->state.stage->out().fan_out_flush();
     self->state.stage->out().force_emit_batches();
     // Remove active partition from the stream.
     self->state.stage->out().close(active.stream_slot);
     // Persist active partition asynchronously.
-    auto part_dir = dir / to_string(active.id);
+    auto part_dir = dir / to_string(id);
     VAST_DEBUG(self, "persists active partition to", part_dir);
     self->request(active.actor, caf::infinite, atom::persist_v, part_dir)
       .then(
         [=](atom::ok) {
-          VAST_VERBOSE(self, "successfully persisted partition", active.id);
-          self->state.unpersisted.erase(active.id);
-          self->state.persisted_partitions.push_back(active.id);
+          VAST_VERBOSE(self, "successfully persisted partition", id);
+          self->state.unpersisted.erase(id);
+          self->state.persisted_partitions.insert(id);
         },
         [=](const caf::error& err) {
-          VAST_ERROR(self, "failed to persist partition", active.id, ":", err);
+          VAST_ERROR(self, "failed to persist partition", id, ":", err);
           self->quit(err);
         });
   };
@@ -388,19 +444,21 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
     },
     [=](caf::unit_t&, caf::downstream<table_slice_ptr>& out,
         table_slice_ptr x) {
+      self->state.stats.layouts[x->layout().name()].count += x->rows();
       auto& active = self->state.active_partition;
       if (!active.actor) {
         create_active_partition();
       } else if (x->rows() > active.capacity) {
         VAST_DEBUG(self, "exceeds active capacity by",
                    (x->rows() - active.capacity));
-        // self->state.passive_partitions[active.id] = active.actor;
-        self->state.lru_partitions.put(active.id, active.actor);
         decomission_active_partition();
-        self->state.flush_to_disk(); // FIXME: delegate this to fs actor
+        self->state.flush_to_disk();
         create_active_partition();
       }
       VAST_DEBUG(self, "forwards table slice", to_string(*x));
+      VAST_DEBUG(self, "slice info:", active.capacity,
+                 self->state.partition_capacity, x->rows());
+
       out.push(x);
       self->state.meta_idx.add(active.id, *x);
       if (active.capacity == self->state.partition_capacity
@@ -418,14 +476,17 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       }
     },
     [=](caf::unit_t&, const caf::error& err) {
-      if (err) {
+      // We get an 'unreachable' error when the stream becomes unreachable
+      // because the actor was destroyed; in this case we can't use `self`
+      // anymore.
+      if (err
+          && caf::exit_reason{err.code()} != caf::exit_reason::unreachable) {
         VAST_ERROR(self, "aborted with error", self->system().render(err));
         // We can shutdown now because we only get a single stream from the
         // importer.
         self->send_exit(self, err);
-      } else {
-        VAST_DEBUG(self, "finalized streaming");
       }
+      VAST_DEBUG_ANON("index finalized streaming");
     });
   self->set_exit_handler([=](const caf::exit_msg& msg) {
     VAST_DEBUG(self, "received EXIT from", msg.source,
@@ -434,21 +495,21 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
     self->state.stage->out().fan_out_flush();
     self->state.stage->out().force_emit_batches();
     self->state.stage->out().close();
-    self->state.stage->stop();
+    self->state.stage->shutdown();
     // Bring down active partition.
     if (self->state.active_partition.actor)
       decomission_active_partition();
     // Collect partitions for termination.
     std::vector<caf::actor> partitions;
-    // partitions.reserve(self->state.passive_partitions.size() + 1);
     partitions.reserve(self->state.lru_partitions.size() + 1);
     partitions.push_back(self->state.active_partition.actor);
     for ([[maybe_unused]] auto& [_, part] : self->state.lru_partitions)
       partitions.push_back(part);
+    // META-FIXME: The below fixme is still for the old code, check if its
+    // still true.
     // FIXME: this manual ref-count decrementing should not be necessary, but
     // it currently doesn't work otherwise.
-    // self->state.passive_partitions.clear();
-    self->state.lru_partitions.clear();
+    // self->state.lru_partitions.clear();
     // Terminate partition actors.
     VAST_DEBUG(self, "brings down", partitions.size(), "partitions");
     shutdown<policy::parallel>(self, std::move(partitions));
@@ -467,10 +528,14 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
     },
     // The partition delegates the actual writing to the filesystem actor,
     // so we dont really get more information than a binary ok/not-ok here.
-    [=](caf::result<atom::ok>) { VAST_VERBOSE(self, "persisted partition"); },
+    [=](caf::result<atom::ok> write_result) {
+      if (write_result.err)
+        VAST_ERROR(self, "could not persist:", write_result.err);
+      else
+        VAST_VERBOSE(self, "successfully persisted partition");
+    },
     // Query handling
     [=](vast::expression expr) {
-      VAST_INFO(self, "got expression", expr); // todo: remove
       auto respond = [&](auto&&... xs) {
         auto mid = self->current_message_id();
         unsafe_response(self, self->current_sender(), {}, mid.response_id(),
@@ -500,23 +565,25 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       }
       // Allows the client to query further results after initial taste.
       auto query_id = uuid::random();
-      auto lookup
-        = index_state::query_state{query_id, expr, std::move(candidates),
-                                   index_state::pending_query_map{}};
-      auto result = st.pending.emplace(lookup.id, std::move(lookup));
+      auto lookup = query_state{query_id, expr, std::move(candidates),
+                                pending_query_map{}};
+      auto result = st.pending.emplace(query_id, std::move(lookup));
       VAST_ASSERT(result.second);
       auto& inserted_lookup = result.first->second;
       st.request_query_map(inserted_lookup, st.taste_partitions);
       // "Yield" the current function.
+      auto mid = self->current_message_id();
+      auto sender = self->current_sender();
       self->delegate(caf::actor_cast<caf::actor>(self), atom::resume_v, expr,
-                     inserted_lookup.id, client);
+                     inserted_lookup.id, client, sender, mid);
     },
     // The `.await()` handlers that are added to this actor in
-    // `build_query_map()` are running as soon as the current coroutine is
-    // suspended, so in between the above handler and the "stage2" handler
+    // `request_query_map()` are running as soon as the current coroutine is
+    // suspended, so in between the above handler and the "resume" handler
     // below. So the query map is filled with the responses from all the
     // selected partitions when we enter the function below.
-    [=](atom::resume, vast::expression expr, uuid query_id, caf::actor client) {
+    [=](atom::resume, vast::expression expr, uuid query_id, caf::actor client,
+        caf::strong_actor_ptr sender, caf::message_id mid) {
       auto& st = self->state;
       // TODO: Can it happen that `st.pending[query_id]` was modified in between
       // the two steps?
@@ -531,12 +598,20 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       // TODO: Does this still work after `delegate()`? Also, why exactly is it
       // necessary?
       auto respond = [&](auto&&... xs) {
-        auto mid = self->current_message_id();
-        unsafe_response(self, self->current_sender(), {}, mid.response_id(),
+        // auto sender = self->current_sender();
+        // auto mid = self->current_message_id();
+        unsafe_response(self, sender, {}, mid.response_id(),
                         std::forward<decltype(xs)>(xs)...);
       };
       if (pqm.empty()) {
-        VAST_ASSERT(lookup.partitions.empty());
+        if (!lookup.partitions.empty()) {
+          // None of the partitions of the first round produced an evaluation
+          // triple, but there are still more to go.
+          st.request_query_map(lookup, st.taste_partitions);
+          self->delegate(caf::actor_cast<caf::actor>(self), atom::resume_v,
+                         expr, lookup.id, client, sender, mid);
+          return;
+        }
         VAST_DEBUG(self, "returns without result: no partitions qualify");
         respond(uuid::nil(), uint32_t{0}, uint32_t{0});
         self->send(client, atom::done_v);
@@ -554,7 +629,7 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
                  "partitions for query", expr);
       // Delegate to query supervisor (uses up this worker) and report
       // query ID + some stats to the client.
-      VAST_INFO(self, "has", st.idle_workers.size(), "idle workers");
+      VAST_DEBUG(self, "has", st.idle_workers.size(), "idle workers");
       self->send(st.next_worker(), std::move(expr), std::move(qm), client);
       if (!st.worker_available())
         self->unbecome();
@@ -575,7 +650,6 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       auto client = caf::actor_cast<caf::actor>(self->current_sender());
       auto iter = st.pending.find(query_id);
       if (iter == st.pending.end()) {
-        VAST_WARNING(self, "got a request for unknown query ID", query_id);
         self->send(client, atom::done_v);
         return;
       }
@@ -583,12 +657,15 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       self->delegate(caf::actor_cast<caf::actor>(self), atom::resume_v,
                      query_id, client);
     },
-    // See also comment above `expression_stage2` handler.
+    // See also comment on the previous `atom::resume` handler above.
     [=](atom::resume, uuid query_id, caf::actor client) {
       auto& st = self->state;
-      // TODO: Is it better to pass the uuid or the query_state that was looked
-      // up in stage1 directly?
       auto iter = st.pending.find(query_id);
+      if (iter == st.pending.end()) {
+        VAST_ERROR(self, "ignoring continuation for unknown query", query_id);
+        self->send(client, atom::done_v);
+        return;
+      }
       auto& pqm = iter->second.pqm;
       if (pqm.empty()) {
         VAST_ASSERT(iter->second.partitions.empty());
@@ -613,24 +690,18 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       self->state.idle_workers.emplace_back(std::move(worker));
     },
     [=](atom::done, [[maybe_unused]] uuid partition_id) {
-      VAST_INFO(self, "query for partition", partition_id, "is done");
-      // FIXME! (not sure if this actually needs to be implemented here anymore,
-      // the new partition actors should just go away if they're not in the lru
-      // cache and have no query acting on them anymore)
-      // self->state.decrement_indexer_count(partition_id);
+      // Nothing to do.
+      VAST_VERBOSE(self, "query for partition", partition_id, "is done");
     },
     [=](caf::stream<table_slice_ptr> in) {
       VAST_DEBUG(self, "got a new source");
       return self->state.stage->add_inbound_path(in);
     },
     [=](atom::status) -> caf::config_value::dictionary {
-      // TODO: reinstate status handling
-      //   return self->state.status();
-      return caf::config_value::dictionary{};
+      return self->state.status();
     },
     [=](atom::subscribe, atom::flush, [[maybe_unused]] caf::actor& listener) {
-      // FIXME!
-      // self->state.add_flush_listener(std::move(listener));
+      self->state.add_flush_listener(std::move(listener));
     });
   return {
     // The default behaviour
@@ -640,23 +711,22 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
       self->become(caf::keep_behavior, st.has_worker);
     },
     [=](atom::done, uuid partition_id) {
-      // FIXME: Is this still needed at all? Do we need to do something
-      // else instead when a query is done?
-      // self->state.decrement_indexer_count(partition_id);
-      VAST_INFO(self, "query for partition", partition_id, "is done");
+      VAST_VERBOSE(self, "query for partition", partition_id, "is done");
     },
     [=](caf::stream<table_slice_ptr> in) {
       VAST_DEBUG(self, "got a new source");
       return self->state.stage->add_inbound_path(in);
     },
+    [=](accountant_type accountant) {
+      namespace defs = defaults::system;
+      self->state.accountant = std::move(accountant);
+      // TODO: The index
+    },
     [=](atom::status) -> caf::config_value::dictionary {
-      // TODO: reinstate status handling
-      // return self->state.status();
-      return caf::config_value::dictionary{};
+      return self->state.status();
     },
     [=](atom::subscribe, atom::flush, [[maybe_unused]] caf::actor& listener) {
-      // FIXME!
-      // self->state.add_flush_listener(std::move(listener));
+      self->state.add_flush_listener(std::move(listener));
     },
   };
 }
@@ -666,7 +736,9 @@ caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
 namespace {
 
 auto make_index_stage(index_state* st) {
-  using impl = detail::notifying_stream_manager<caf::stateful_actor<index_state>, indexer_stage_driver>;
+  using impl
+    = detail::notifying_stream_manager<caf::stateful_actor<index_state>,
+                                       indexer_stage_driver>;
   auto result = caf::make_counted<impl>(st->self, st->self);
   result->continuous(true);
   return result;

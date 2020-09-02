@@ -17,10 +17,11 @@
 #include "vast/detail/lru_cache.hpp"
 #include "vast/detail/stable_map.hpp"
 #include "vast/expression.hpp"
-#include "vast/filesystem.hpp"
+#include "vast/fbs/index.hpp"
 #include "vast/fwd.hpp"
 #include "vast/meta_index.hpp"
 #include "vast/system/accountant.hpp"
+#include "vast/system/filesystem.hpp"
 #include "vast/system/indexer_stage_driver.hpp"
 #include "vast/system/partition.hpp"
 #include "vast/system/query_supervisor.hpp"
@@ -30,6 +31,7 @@
 #include <caf/actor.hpp>
 #include <caf/behavior.hpp>
 #include <caf/fwd.hpp>
+#include <caf/meta/omittable_if_empty.hpp>
 #include <caf/meta/type_name.hpp>
 
 #include <unordered_map>
@@ -40,6 +42,9 @@
 namespace vast::system {
 
 namespace v2 {
+
+// FIXME: move to vast/fwd.hpp
+struct index_state;
 
 /// The state of the active partition.
 struct active_partition_state {
@@ -83,48 +88,56 @@ struct index_statistics {
   }
 };
 
+/// Loads partitions from disk by UUID.
+// FIXME: forward-declare in vast/fwd.hpp
+class partition_factory {
+public:
+  explicit partition_factory(index_state& state) : state_{state} {
+    // nop
+  }
+
+  caf::actor operator()(const uuid& id) const;
+
+private:
+  const index_state& state_;
+};
+
+// FIXME: move to vast/fwd.hpp
+using pending_query_map = detail::stable_map<uuid, evaluation_triples>;
+
+// equivalent of lookup_state in the old index
+// FIXME: forward-declare in vast/fwd.hpp
+// TODO: write docs
+struct query_state {
+  /// The UUID of the query.
+  vast::uuid id;
+
+  /// The query expression.
+  vast::expression expression;
+
+  /// Unscheduled partitions.
+  std::vector<uuid> partitions;
+
+  // Tells which INDEXER actors we need to query for a given partition.
+  pending_query_map pqm;
+
+  template <class Inspector>
+  friend auto inspect(Inspector& f, query_state& x) {
+    return f(caf::meta::type_name("query_state"), x.id, x.expression,
+             caf::meta::omittable_if_empty(), x.partitions,
+             caf::meta::omittable_if_empty(), x.pqm);
+  }
+};
+
 /// The state of the index actor.
 struct index_state {
+  // -- type aliases -----------------------------------------------------------
+
   using index_stream_stage_ptr
     = caf::stream_stage_ptr<table_slice_ptr,
                             caf::broadcast_downstream_manager<table_slice_ptr>>;
 
-  using pending_query_map = detail::stable_map<uuid, evaluation_triples>;
-
-  // equivalent of lookup_state in the old index
-  struct query_state {
-    /// The UUID of the query.
-    vast::uuid id;
-
-    /// The query expression.
-    vast::expression expression;
-
-    /// The evaluators for this query
-    // std::set<caf::actor> evaluators;
-
-    /// Unscheduled partitions.
-    std::vector<uuid> partitions;
-
-    // Maps partition IDs to the EVALUATOR actors we are going to spawn.
-    pending_query_map pqm;
-  };
-
-  /// Loads partitions from disk by UUID.
-  class partition_factory {
-  public:
-    explicit partition_factory(index_state* st = nullptr) : st_(st) {
-      // nop
-    }
-
-    caf::actor operator()(const uuid& id) const;
-
-  private:
-    index_state* st_;
-  };
-
-  /// Stores partitions sorted by access frequency.
-  using partition_cache_type
-    = detail::lru_cache<uuid, caf::actor, partition_factory>;
+  // -- constructor ------------------------------------------------------------
 
   explicit index_state(caf::stateful_actor<index_state>* self);
 
@@ -132,15 +145,14 @@ struct index_state {
 
   caf::error load_from_disk();
 
+  // void init(const vast::fbs::Index& index);
+
+  /// @returns various status metrics.
+  caf::dictionary<caf::config_value> status() const;
+
   caf::error flush_to_disk();
 
   path index_filename(path basename = {}) const;
-
-  path statistics_filename(path basename = {}) const;
-
-  caf::error flush_index();
-
-  caf::error flush_statistics();
 
   // -- query handling
 
@@ -157,7 +169,15 @@ struct index_state {
   /// Spawns one evaluator for each partition.
   /// @returns a query map for passing to INDEX workers over the spawned
   ///          EVALUATOR actors.
-  query_map launch_evaluators(pending_query_map pqm, expression expr);
+  query_map launch_evaluators(pending_query_map& pqm, expression expr);
+
+  // -- flush handling ---------------------------------------------------
+
+  /// Adds a new flush listener.
+  void add_flush_listener(caf::actor listener);
+
+  /// Sends a notification to all listeners and clears the listeners list.
+  void notify_flush_listeners();
 
   // -- data members ----------------------------------------------------------
 
@@ -182,18 +202,20 @@ struct index_state {
   /// unpin them after they're safely on disk.
   std::unordered_map<uuid, caf::actor> unpersisted;
 
-  /// The set of passive (read-only) partitions.
-  partition_cache_type lru_partitions;
+  /// The set of passive (read-only) partitions currently loaded into memory.
+  detail::lru_cache<uuid, caf::actor, partition_factory> lru_partitions;
 
   /// The set of partitions that exist on disk.
-  /// TODO: not sure if we even need this
-  std::vector<uuid> persisted_partitions;
+  std::unordered_set<uuid> persisted_partitions;
 
   /// The maximum number of events that a partition can hold.
   size_t partition_capacity;
 
+  // The maximum size of the partition LRU cache (or the maximum number of
+  // read-only partition loaded to memory).
   size_t in_mem_partitions;
 
+  // The number of partitions initially returned for a query.
   size_t taste_partitions;
 
   /// Maps query IDs to pending lookup state.
@@ -211,16 +233,34 @@ struct index_state {
   /// Statistics about processed data.
   index_statistics stats;
 
+  // Handle of the accountant.
+  accountant_type accountant;
+
+  /// List of actors that wait for the next flush event.
+  std::vector<caf::actor> flush_listeners;
+
+  filesystem_type fs_actor;
+
   static inline const char* name = "index";
 };
 
+/// Flatbuffer integration. Note that this is only one-way, restoring
+/// the index state needs additional runtime information.
+// TODO: Pull out the persisted part of the state into a separate struct
+// that can be packed and unpacked.
+caf::expected<flatbuffers::Offset<fbs::Index>>
+pack(flatbuffers::FlatBufferBuilder& builder, const index_state& x);
+
 /// Indexes events in horizontal partitions.
+/// @param fs The filesystem actor. Not used by the index itself but forwarded
+/// to partitions.
 /// @param dir The directory of the index.
 /// @param partition_capacity The maximum number of events per partition.
 /// @pre `partition_capacity > 0
-caf::behavior index(caf::stateful_actor<index_state>* self, path dir,
-                    size_t partition_capacity, size_t in_mem_partitions,
-                    size_t taste_partitions, size_t num_workers);
+caf::behavior
+index(caf::stateful_actor<index_state>* self, filesystem_type fs, path dir,
+      size_t partition_capacity, size_t in_mem_partitions,
+      size_t taste_partitions, size_t num_workers);
 
 } // namespace v2
 
