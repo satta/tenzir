@@ -34,6 +34,7 @@
 #include "vast/fbs/utils.hpp"
 #include "vast/fbs/uuid.hpp"
 #include "vast/fbs/version.hpp"
+#include "vast/fwd.hpp"
 #include "vast/ids.hpp"
 #include "vast/io/read.hpp"
 #include "vast/io/save.hpp"
@@ -244,7 +245,7 @@ void index_state::request_query_map(query_state& lookup,
   std::partition(lookup.partitions.begin(), lookup.partitions.end(),
                  partition_is_loaded);
   // Helper function to spin up EVALUATOR actors for a single partition.
-  auto spin_up = [&](const uuid& partition_id) {
+  auto spin_up = [&](const uuid& partition_id) -> caf::actor {
     // We need to first check whether the ID is the active partition or one
     // of our unpersisted ones. Only then can we dispatch to our LRU cache.
     caf::actor part;
@@ -256,30 +257,10 @@ void index_state::request_query_map(query_state& lookup,
     else if (auto it = persisted_partitions.find(partition_id);
              it != persisted_partitions.end())
       part = lru_partitions.get_or_load(partition_id);
-    if (!part) {
+    if (!part)
       VAST_ERROR("Could not load partition", partition_id,
                  "that was part of a query");
-      return false;
-    }
-    // Note that `.await()` doesnt block until after the handler returns.
-    // FIXME: I think a better design is request() -> then() -> send
-    // atom::resume with the created pending_query_map as param
-    self->request(part, caf::infinite, atom::evaluate_v, lookup.expression)
-      .await(
-        [=, &lookup](evaluation_triples triples) {
-          if (triples.empty()) {
-            VAST_DEBUG(self, "identified partition", partition_id,
-                       "as candidate in the meta index, but it didn't produce "
-                       "an "
-                       "evaluation map");
-            return;
-          }
-          lookup.pqm.emplace(partition_id, std::move(triples));
-        },
-        [=](const caf::error& error) {
-          VAST_ERROR(self, "failed to request evaluation map", error);
-        });
-    return true;
+    return part;
   };
   // Loop over the candidate set until we either successfully scheduled
   // num_partitions partitions or run out of candidates.
@@ -289,17 +270,52 @@ void index_state::request_query_map(query_state& lookup,
   // that they didn't count towards the minimum. This is kinda hard to
   // replicate in the new asynchronous scenario, but if it turns out to
   // be relevant to performance we might need to reinstate it.
-  size_t launched = 0;
-  {
-    auto it = lookup.partitions.begin();
-    auto last = lookup.partitions.end();
-    auto count = std::min<size_t>(std::distance(it, last), num_partitions);
-    for (size_t i = 0; i < count; ++i)
-      launched += spin_up(*it++);
-    lookup.partitions.erase(lookup.partitions.begin(), it);
+  auto it = lookup.partitions.begin();
+  auto last = lookup.partitions.end();
+  auto count = std::min<size_t>(std::distance(it, last), num_partitions);
+  std::vector<std::pair<uuid, caf::actor>> launched;
+  for (size_t i = 0; i < count; ++i) {
+    auto& id = *it++;
+    if (auto part = spin_up(id))
+      launched.push_back(std::make_pair(id, part));
   }
-  VAST_DEBUG(self, "launched", launched,
+  lookup.partitions.erase(lookup.partitions.begin(), it);
+  VAST_DEBUG(self, "launched", launched.size(),
              "await handlers to fill the pending query map");
+  // Note that `.await()` doesnt block until after the handler returns.
+  // FIXME: I think a better design is request() -> then() -> send
+  // atom::resume with the created pending_query_map as param
+  struct counter {
+    explicit counter(size_t expected, caf::response_promise&& response): expected(expected), response(std::move(response)) {}
+    size_t expected;
+    size_t received;
+    pending_query_map pqm;
+    caf::response_promise response;
+  };
+  auto shared_counter = std::make_shared<counter>(launched.size(), self->make_response_promise());
+  for (auto& kv : launched) {
+    auto partition_id = kv.first;
+    auto partition_actor = kv.second;
+    self->request(partition_actor, caf::infinite, atom::evaluate_v, lookup.expression)
+      .then(
+        [=](evaluation_triples triples) {
+          ++shared_counter->received;
+          if (triples.empty()) {
+            VAST_DEBUG(self, "identified partition", partition_id,
+                       "as candidate in the meta index, but it didn't produce "
+                       "an "
+                       "evaluation map");
+            return;
+          }
+          shared_counter->pqm.emplace(partition_id, std::move(triples));
+          if (shared_counter->received == shared_counter->expected)
+            self->send(self, atom::resume_v, )
+        },
+        [=](const caf::error& error) {
+          ++shared_counter->received;
+          VAST_ERROR(self, "failed to request evaluation map", error);
+        });
+  }
   return;
 }
 
