@@ -198,7 +198,7 @@ jobs:
           echo "PUBLISH_NAME=$PUBLISH_NAME" >> $GITHUB_ENV
 
       - name: Fetch ccache Cache
-        uses: pat-s/always-upload-cache@v2
+        uses: pat-s/always-upload-cache@v3.0.1
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ github.workflow }}-Debian-${{ matrix.build.compiler }}-${{ matrix.configure.tag }}-${{ github.sha }}
@@ -408,7 +408,7 @@ jobs:
           echo "CXXFLAGS=-isystem ${llvm_root}/include/c++/v1" >> $GITHUB_ENV
 
       - name: Fetch ccache Cache
-        uses: pat-s/always-upload-cache@v2
+        uses: pat-s/always-upload-cache@v3.0.1
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ github.workflow }}-macOS-${{ matrix.build.compiler }}-${{ matrix.configure.tag }}-${{ github.sha }}
