@@ -65,7 +65,7 @@ void attach_result_stream(
         state.self = self;
         state.self_ptr = self;
       },
-      [](stream_state& state, caf::downstream<table_slice>& out, size_t hint) {
+      [self](stream_state& state, caf::downstream<table_slice>& out, size_t hint) {
         auto& results = state.self_ptr->state.sink_buffer;
         (void)hint; // We could consider using `hint`.
         if (!results.empty()) {
