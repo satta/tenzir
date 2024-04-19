@@ -51,10 +51,9 @@ components:
           example: false
         ttl:
           type: string
-          description: >
+          description: |
             A duration string specifying the maximum time for this pipeline to
             exist. No value means the pipeline is allowed to exist forever.
-
             This parameter must be defined if the `hidden` parameter is true.
           default: null
           example: 5.0m
@@ -62,6 +61,17 @@ components:
           $ref: '#/components/schemas/PipelineAutostart'
         autodelete:
           $ref: '#/components/schemas/PipelineAutodelete'
+        retry_delay:
+          type: string
+          description: >
+            A duration string specifying the minimum time between automatic
+            restarts
+
+            of a pipeline when an error occurs. Takes no effect if restarting on
+
+            failure is disabled.
+          default: 1.0m
+          example: 500.0ms
     Diagnostic:
       type: object
       properties:
@@ -89,6 +99,20 @@ components:
       type: array
       items:
         $ref: '#/components/schemas/Diagnostic'
+    Launch Response For Pipeline With Explicit Sink:
+      type: object
+      properties:
+        deployable:
+          type: boolean
+          description: Returns this property with the value `true`.
+    Launch Response For Pipeline Without Explicit Sink:
+      type: object
+      properties:
+        id:
+          type: string
+          description: >-
+            (If the pipeline does not end with a predefined sink) The ID of the
+            successfully created pipeline.
     LaunchParameters:
       allOf:
         - $ref: '#/components/schemas/CreateParameters'
@@ -118,106 +142,6 @@ components:
         end:
           type: number
           example: 48
-    Metrics:
-      type: object
-      description: Information about pipeline data ingress and egress.
-      properties:
-        total:
-          type: object
-          description: Information about total pipeline metrics (e.g. total ingress/egress)
-          properties:
-            ingress:
-              type: object
-              description: >-
-                Information about the total ingress. Contains no values when the
-                source operator has not run.
-              properties:
-                unit:
-                  type: string
-                  enum:
-                    - bytes
-                    - events
-                  description: The unit of the input data.
-                  example: bytes
-                internal:
-                  type: boolean
-                  description: Whether the operator's ingress is internal.
-                  example: false
-                num_elements:
-                  type: integer
-                  description: >-
-                    The total amount of elements that entered the pipeline
-                    source.
-                  example: 109834
-                num_batches:
-                  type: integer
-                  description: >-
-                    The total amount of batches that were generated during data
-                    processing in the pipeline source.
-                  example: 2
-                num_approx_bytes:
-                  type: integer
-                  description: >-
-                    The total amount of bytes that entered the pipeline source.
-                    For events, this value is an approximation.
-                  example: 30414
-                total_seconds:
-                  type: number
-                  description: >-
-                    The total duration of the pipeline source operation in
-                    seconds.
-                  example: 1.233998321
-                processing_seconds:
-                  type: number
-                  description: >-
-                    The total duration of the pipeline source data processing in
-                    seconds.
-                  example: 1.179999992
-            egress:
-              type: object
-              description: >-
-                Information about the total egress. Contains no values when the
-                sink operator has not run.
-              properties:
-                unit:
-                  type: string
-                  enum:
-                    - bytes
-                    - events
-                  description: The unit of the output data.
-                  example: bytes
-                internal:
-                  type: boolean
-                  description: Whether the operator's egress is internal.
-                  example: false
-                num_elements:
-                  type: integer
-                  description: The total amount of elements that entered the pipeline sink.
-                  example: 30414
-                num_batches:
-                  type: integer
-                  description: >-
-                    The total amount of batches that were generated during data
-                    processing in the pipeline sink.
-                  example: 1
-                num_approx_bytes:
-                  type: integer
-                  description: >-
-                    The total amount of bytes that entered the pipeline sink.
-                    For events, this value is an approximation.
-                  example: 30414
-                total_seconds:
-                  type: number
-                  description: >-
-                    The total duration of the pipeline sink operation in
-                    seconds.
-                  example: 2.945935512
-                processing_seconds:
-                  type: number
-                  description: >-
-                    The total duration of the pipeline sink data processing in
-                    seconds.
-                  example: 1.452123512
     Note:
       type: object
       properties:
@@ -282,6 +206,11 @@ components:
         definition:
           type: string
           description: The pipeline definition.
+        hidden:
+          type: bool
+          description: >-
+            Whether this pipeline is hidden. Hidden pipelines are only available
+            through the `show pipelines` operator.
         created_at:
           type: integer
           format: int64
@@ -290,6 +219,11 @@ components:
           type: integer
           format: int64
           description: The Unix timestamp of the last pipeline modification in nanoseconds.
+        start_time:
+          type: string
+          description: >-
+            If the pipeline has been started, the ISO 8601 timestamp of the most
+            recent start.
         total_runs:
           type: integer
           description: The total amount of runs this pipeline has attempted so far.
@@ -306,10 +240,18 @@ components:
           description: The error that the pipeline may have encountered during running.
         diagnostics:
           $ref: '#/components/schemas/Diagnostics'
-        metrics:
-          $ref: '#/components/schemas/Metrics'
         labels:
           $ref: '#/components/schemas/PipelineLabels'
+        retry_delay:
+          type: string
+          description: >
+            A duration string specifying the minimum time between automatic
+            restarts
+
+            of a pipeline when an error occurs. Takes no effect if restarting on
+
+            failure is disabled.
+          example: 10.0s
         autostart:
           $ref: '#/components/schemas/PipelineAutostart'
         autodelete:
@@ -448,9 +390,9 @@ paths:
       summary: Launch a new pipeline
       description: >-
         Depending on whether the pipeline ends with a sink, create the pipeline
-        with a [`serve` sink](https://docs.tenzir.com/operators/sinks/serve)
-        with the provided `/pipeline/create` parameters or notify that this
-        pipeline is deployable for further action.
+        with a [`serve` sink](https://docs.tenzir.com/operators/serve) with the
+        provided `/pipeline/create` parameters or notify that this pipeline is
+        deployable for further action.
       requestBody:
         required: true
         content:
@@ -463,18 +405,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                    description: >-
-                      (If the pipeline does not end with a predefined sink) The
-                      ID of the successfully created pipeline.
-                  deployable:
-                    type: boolean
-                    description: >-
-                      (If the pipeline ends with a predefined sink) Returns this
-                      property with the value `true`.
+                oneOf:
+                  - $ref: >-
+                      #/components/schemas/Launch Response For Pipeline With
+                      Explicit Sink
+                  - $ref: >-
+                      #/components/schemas/Launch Response For Pipeline Without
+                      Explicit Sink
   /pipeline/list:
     post:
       summary: List all existing pipelines
@@ -497,27 +434,21 @@ paths:
                     - id: 4c7f2b11-6169-4d1b-89b4-4fc0a68b3d4a
                       name: user-assigned-name
                       definition: export | where foo | publish /bar
+                      hidden: false
                       created_at: 1706180157837037600
                       last_modifed: 1706180157837038000
                       state: running
                       error: null
                       diagnostics: []
-                      metrics:
-                        total:
-                          ingress: {}
-                          egress: {}
                     - id: 08446737-da9b-4787-8599-97d85c48c3bb
                       name: wrong-pipeline
                       definition: export asdf
-                      created_at: null
-                      last_modifed: null
+                      hidden: false
+                      created_at: 1706180157837037600
+                      last_modifed: 1706180157837038000
                       state: failed
                       error: format 'asdf' not found
                       diagnostics: []
-                      metrics:
-                        total:
-                          ingress: {}
-                          egress: {}
         '400':
           description: Invalid arguments.
           content:
@@ -628,6 +559,21 @@ paths:
                   example: zeek-monitoring-pipeline
                 labels:
                   $ref: '#/components/schemas/PipelineLabels'
+                autostart:
+                  $ref: '#/components/schemas/PipelineAutostart'
+                autodelete:
+                  $ref: '#/components/schemas/PipelineAutodelete'
+                retry_delay:
+                  type: string
+                  description: >
+                    A duration string specifying the minimum time between
+                    automatic restarts
+
+                    of a pipeline when an error occurs. Takes no effect if
+                    restarting on
+
+                    failure is disabled.
+                  example: 500.0ms
       responses:
         '200':
           description: Success.
@@ -778,41 +724,3 @@ paths:
                     type: string
                     example: Invalid arguments
                     description: The error message.
-  /status:
-    post:
-      summary: Return current status
-      description: Returns the current status of the whole node.
-      requestBody:
-        description: Body for the status endpoint
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                component:
-                  type: string
-                  description: If specified, return the status for that component only.
-                  example: index
-                verbosity:
-                  type: string
-                  enum:
-                    - info
-                    - detailed
-                    - debug
-                  default: info
-      responses:
-        '200':
-          description: OK.
-          content:
-            application/json:
-              schema:
-                type: object
-              example:
-                catalog:
-                  num-partitions: 7092
-                  memory-usage: 52781901584
-                version:
-                  Tenzir: v2.3.0-rc3-32-g8529a6c43f
-        '401':
-          description: Not authenticated.
